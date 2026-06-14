@@ -22,6 +22,13 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Capi.Sample", "Capi.Sample\
 		{00E19325-42DF-4702-BF67-15521B736574} = {00E19325-42DF-4702-BF67-15521B736574}
 	EndProjectSection
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "CapiWeb.Tests", "CapiWeb.Tests\CapiWeb.Tests.vcxproj", "{4B21A3D0-0D32-4C87-8E18-5B6F7D6A49EF}"
+	ProjectSection(ProjectDependencies) = postProject
+		{7CA4C94E-7491-4DE9-BA51-0BB02FB2DD60} = {7CA4C94E-7491-4DE9-BA51-0BB02FB2DD60}
+		{02AEA09A-E5A7-4745-A108-91DD212F9CD6} = {02AEA09A-E5A7-4745-A108-91DD212F9CD6}
+		{00E19325-42DF-4702-BF67-15521B736574} = {00E19325-42DF-4702-BF67-15521B736574}
+	EndProjectSection
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -70,6 +77,14 @@ Global
 		{5ABD74C5-B49A-419B-B705-79CDF94623BC}.Release|x64.Build.0 = Release|x64
 		{5ABD74C5-B49A-419B-B705-79CDF94623BC}.Release|x86.ActiveCfg = Release|Win32
 		{5ABD74C5-B49A-419B-B705-79CDF94623BC}.Release|x86.Build.0 = Release|Win32
+		{4B21A3D0-0D32-4C87-8E18-5B6F7D6A49EF}.Debug|x64.ActiveCfg = Debug|x64
+		{4B21A3D0-0D32-4C87-8E18-5B6F7D6A49EF}.Debug|x64.Build.0 = Debug|x64
+		{4B21A3D0-0D32-4C87-8E18-5B6F7D6A49EF}.Debug|x86.ActiveCfg = Debug|Win32
+		{4B21A3D0-0D32-4C87-8E18-5B6F7D6A49EF}.Debug|x86.Build.0 = Debug|Win32
+		{4B21A3D0-0D32-4C87-8E18-5B6F7D6A49EF}.Release|x64.ActiveCfg = Release|x64
+		{4B21A3D0-0D32-4C87-8E18-5B6F7D6A49EF}.Release|x64.Build.0 = Release|x64
+		{4B21A3D0-0D32-4C87-8E18-5B6F7D6A49EF}.Release|x86.ActiveCfg = Release|Win32
+		{4B21A3D0-0D32-4C87-8E18-5B6F7D6A49EF}.Release|x86.Build.0 = Release|Win32
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

@@ -12,6 +12,7 @@
 #include <any>
 #include <charconv>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -94,6 +95,43 @@ private:
 };
 
 using ValueMap = std::unordered_map<std::string, std::string>;
+using ValueListMap = std::unordered_map<std::string, std::vector<std::string>>;
+
+struct MultipartFile {
+    std::string Name;
+    std::string FileName;
+    std::string ContentType;
+    HeaderCollection Headers;
+    std::string Body;
+};
+
+struct FormOptions {
+    std::size_t ValueCountLimit = 1024;
+    std::size_t KeyLengthLimit = 2048;
+    std::size_t ValueLengthLimit = 4 * 1024 * 1024;
+    std::size_t MultipartBoundaryLengthLimit = 128;
+    std::size_t MultipartFileCountLimit = 128;
+    std::size_t MultipartHeadersCountLimit = 16;
+    std::size_t MultipartHeadersLengthLimit = 16 * 1024;
+    std::uint64_t MultipartBodyLengthLimit = 128ull * 1024ull * 1024ull;
+};
+
+enum class CookieSameSiteMode {
+    Unspecified,
+    Lax,
+    Strict,
+    None,
+};
+
+struct CookieOptions {
+    std::string Path;
+    std::string Domain;
+    std::optional<std::chrono::system_clock::time_point> Expires;
+    std::optional<std::chrono::seconds> MaxAge;
+    bool HttpOnly = false;
+    bool Secure = false;
+    CookieSameSiteMode SameSite = CookieSameSiteMode::Unspecified;
+};
 
 class ClaimsPrincipal {
 public:
@@ -125,6 +163,13 @@ private:
     std::unordered_map<std::string, std::vector<std::string>> claims_;
 };
 
+struct EndpointMatch {
+    std::string Pattern;
+    std::string Name;
+    std::vector<std::string> Methods;
+    bool IsFallback = false;
+};
+
 class HttpRequest {
 public:
     const std::string& Method() const noexcept;
@@ -144,16 +189,31 @@ public:
     HttpRequest& Scheme(std::string scheme);
     HttpRequest& Host(std::string host);
     HttpRequest& Header(std::string name, std::string value);
+    HttpRequest& AddHeader(std::string name, std::string value);
+    HttpRequest& RemoveHeader(std::string_view name);
 
     const HeaderCollection& Headers() const noexcept;
     const ValueMap& Query() const noexcept;
+    const ValueListMap& QueryValues() const noexcept;
     const ValueMap& RouteValues() const noexcept;
+    const ValueMap& Cookies() const;
+    const ValueMap& Form() const;
+    const ValueListMap& FormValues() const;
+    const std::vector<MultipartFile>& Files() const;
+    const MultipartFile* File(std::string_view name) const;
 
     std::string Header(std::string_view name, std::string defaultValue = {}) const;
+    std::string Cookie(std::string_view name, std::string defaultValue = {}) const;
+    std::string FormValue(std::string_view name, std::string defaultValue = {}) const;
+    std::vector<std::string> FormValues(std::string_view name) const;
     std::string QueryValue(std::string_view name, std::string defaultValue = {}) const;
+    std::vector<std::string> QueryValues(std::string_view name) const;
     std::string RouteValue(std::string_view name, std::string defaultValue = {}) const;
     std::string Value(std::string_view name, std::string defaultValue = {}) const;
     bool HasJsonContentType() const;
+    bool HasFormUrlEncodedContentType() const;
+    bool HasMultipartFormDataContentType() const;
+    bool HasFormContentType() const;
 
     System::Text::Json::JsonElement Json() const;
 
@@ -168,7 +228,13 @@ private:
     std::string host_;
     HeaderCollection headers_;
     ValueMap query_;
+    ValueListMap queryValues_;
     ValueMap routeValues_;
+    mutable std::optional<ValueMap> cookies_;
+    mutable std::optional<ValueMap> form_;
+    mutable std::optional<ValueListMap> formValues_;
+    mutable std::optional<std::vector<MultipartFile>> files_;
+    mutable FormOptions formOptions_;
     mutable std::shared_ptr<System::Text::Json::JsonDocument> jsonDocument_;
 
     friend class WebApplication;
@@ -195,6 +261,8 @@ public:
     HttpResponse& WriteBytes(const void* data, std::size_t size);
     HttpResponse& WriteBytes(std::vector<std::uint8_t> bytes);
     HttpResponse& ClearBody();
+    HttpResponse& AppendCookie(std::string name, std::string value, CookieOptions options = {});
+    HttpResponse& DeleteCookie(std::string name, CookieOptions options = {});
 
 private:
     int statusCode_ = 200;
@@ -219,12 +287,17 @@ public:
     const ClaimsPrincipal& User() const noexcept;
     HttpContext& User(ClaimsPrincipal user);
 
+    const std::optional<EndpointMatch>& MatchedEndpoint() const noexcept;
+    std::string EndpointName(std::string defaultValue = {}) const;
+    std::string EndpointPattern(std::string defaultValue = {}) const;
+
 private:
     HttpRequest request_;
     HttpResponse response_;
     std::string traceIdentifier_;
     ClaimsPrincipal user_;
     std::unordered_map<std::string, std::any> items_;
+    std::optional<EndpointMatch> matchedEndpoint_;
 
     friend class WebApplication;
     friend class HttpSysServer;
@@ -261,6 +334,8 @@ public:
     const std::vector<std::uint8_t>& Body() const noexcept;
 
     HttpResult& Header(std::string name, std::string value);
+    HttpResult& AppendCookie(std::string name, std::string value, CookieOptions options = {});
+    HttpResult& DeleteCookie(std::string name, CookieOptions options = {});
     HttpResult& WriteBytes(std::vector<std::uint8_t> bytes);
     void Apply(HttpResponse& response) const;
 
@@ -286,6 +361,7 @@ public:
     static HttpResult Bytes(const void* data, std::size_t size, std::string contentType = "application/octet-stream", int statusCode = 200);
     static HttpResult Bytes(const std::vector<std::uint8_t>& bytes, std::string contentType = "application/octet-stream", int statusCode = 200);
     static HttpResult File(std::vector<std::uint8_t> bytes, std::string contentType = "application/octet-stream", std::string downloadName = {});
+    static HttpResult File(const std::filesystem::path& path, std::string contentType = {}, std::string downloadName = {});
 
     static HttpResult Json(const System::Text::Json::JsonElement& value, int statusCode = 200);
     static HttpResult Json(const System::Text::Json::JsonNode& value, int statusCode = 200);
@@ -299,12 +375,18 @@ public:
     static HttpResult Ok();
     static HttpResult Ok(std::string_view text);
     static HttpResult Ok(const System::Text::Json::JsonNode& value);
+    static HttpResult Created(std::string location);
+    static HttpResult Created(std::string location, const System::Text::Json::JsonElement& value);
     static HttpResult Created(std::string location, const System::Text::Json::JsonNode& value);
+    static HttpResult Accepted(std::string location = {});
+    static HttpResult Accepted(std::string location, const System::Text::Json::JsonElement& value);
+    static HttpResult Accepted(std::string location, const System::Text::Json::JsonNode& value);
     static HttpResult NoContent();
     static HttpResult BadRequest(std::string detail = {});
     static HttpResult Unauthorized(std::string detail = {});
     static HttpResult Forbidden(std::string detail = {});
     static HttpResult NotFound(std::string detail = {});
+    static HttpResult Conflict(std::string detail = {});
     static HttpResult TooManyRequests(std::string detail = {});
     static HttpResult Problem(std::string title, std::string detail = {}, int statusCode = 500);
     static HttpResult Redirect(std::string location, bool permanent = false);
@@ -313,6 +395,7 @@ public:
 using EndpointHandler = std::function<HttpResult(HttpContext&)>;
 using RequestDelegate = std::function<HttpResult(HttpContext&)>;
 using Middleware = std::function<HttpResult(HttpContext&, RequestDelegate)>;
+using EndpointFilter = Middleware;
 using ApplicationCallback = std::function<void()>;
 using RateLimitKeySelector = std::function<std::string(HttpContext&)>;
 class AuthenticationResult;
@@ -325,6 +408,8 @@ enum class BindingSource {
     Route,
     Query,
     Header,
+    Cookie,
+    Form,
     Body,
     JsonProperty,
 };
@@ -332,6 +417,11 @@ enum class BindingSource {
 class ParameterBindingException : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
+};
+
+class UnsupportedMediaTypeBindingException : public ParameterBindingException {
+public:
+    using ParameterBindingException::ParameterBindingException;
 };
 
 template <class T>
@@ -377,6 +467,16 @@ BindingParameter<T> Query(std::string name) {
 template <class T>
 BindingParameter<T> Header(std::string name) {
     return BindingParameter<T>(BindingSource::Header, std::move(name));
+}
+
+template <class T>
+BindingParameter<T> Cookie(std::string name) {
+    return BindingParameter<T>(BindingSource::Cookie, std::move(name));
+}
+
+template <class T>
+BindingParameter<T> Form(std::string name) {
+    return BindingParameter<T>(BindingSource::Form, std::move(name));
 }
 
 template <class T = System::Text::Json::JsonElement>
@@ -430,11 +530,22 @@ struct HttpSysTimeoutOptions {
     std::uint32_t MinSendRateBytesPerSecond = 150;
 };
 
+struct HttpSysBackpressureOptions {
+    int StoppingStatusCode = 503;
+    std::string StoppingDetail = "Server is stopping.";
+    int StoppingRetryAfterSeconds = 5;
+    int OverloadedStatusCode = 503;
+    std::string OverloadedDetail = "Too many concurrent requests.";
+    int OverloadedRetryAfterSeconds = 1;
+};
+
 struct HttpSysOptions {
     std::vector<std::string> UrlPrefixes = { "http://localhost:8080/" };
     std::uint32_t WorkerCount = 0;
     std::uint32_t RequestBufferSize = 64 * 1024;
     std::uint64_t MaxRequestBodyBytes = 16ull * 1024ull * 1024ull;
+    std::uint64_t MaxRequestUrlBytes = 16ull * 1024ull;
+    std::uint64_t MaxRequestHeaderBytes = 64ull * 1024ull;
     std::uint32_t MaxConcurrentRequests = 0;
     std::chrono::milliseconds StopTimeout = std::chrono::seconds(5);
     bool AddServerHeader = true;
@@ -442,6 +553,7 @@ struct HttpSysOptions {
     UrlReservationOptions UrlReservation;
     std::vector<SslCertificateBinding> SslCertificateBindings;
     HttpSysTimeoutOptions Timeouts;
+    HttpSysBackpressureOptions Backpressure;
 };
 
 struct StaticFileOptions {
@@ -453,6 +565,27 @@ struct StaticFileOptions {
     std::vector<std::string> SpaFallbackExcludedPrefixes = { "/api" };
     bool ServeUnknownFileTypes = false;
     std::string UnknownFileContentType = "application/octet-stream";
+    bool ServeHiddenFiles = false;
+    std::vector<std::string> BlockedFileNames = {
+        ".env",
+        ".env.*",
+        "appsettings.json",
+        "appsettings.*.json",
+        "secrets.json",
+        "web.config",
+        "package.json",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock"
+    };
+    std::vector<std::string> BlockedPathSegments = {
+        ".git",
+        ".hg",
+        ".svn",
+        ".vs",
+        "node_modules"
+    };
+    std::uint64_t MaximumFileSizeBytes = 64ull * 1024ull * 1024ull;
     std::string CacheControl;
     bool EnableConditionalRequests = true;
     bool EnableRangeProcessing = true;
@@ -491,6 +624,26 @@ struct ResponseCompressionOptions {
         "application/wasm",
         "font/"
     };
+};
+
+struct RequestDecompressionOptions {
+    bool Enable = true;
+    bool EnableGzip = true;
+    bool EnableDeflate = true;
+    std::uint64_t MaxDecompressedBodyBytes = 0;
+    bool RemoveContentEncodingHeader = true;
+    bool UpdateContentLengthHeader = true;
+};
+
+struct ResponseCachingOptions {
+    bool Enable = true;
+    bool AddETagHeader = true;
+    bool EnableConditionalRequests = true;
+    bool UseWeakETags = true;
+    std::size_t MaximumBodySize = 1024 * 1024;
+    std::string CacheControl;
+    bool CacheAuthenticatedResponses = false;
+    bool SkipSetCookieResponses = true;
 };
 
 class AuthenticationResult {
@@ -539,6 +692,12 @@ struct AuthorizationPolicy {
     std::vector<std::string> RequiredRoles;
     std::vector<AuthorizationClaimRequirement> RequiredClaims;
     AuthorizationHandler Assertion;
+
+    AuthorizationPolicy& RequireRole(std::string role);
+    AuthorizationPolicy& RequireRoles(std::initializer_list<std::string> roles);
+    AuthorizationPolicy& RequireRoles(std::vector<std::string> roles);
+    AuthorizationPolicy& RequireClaim(std::string type);
+    AuthorizationPolicy& RequireClaim(std::string type, std::string value);
 };
 
 struct AuthorizationOptions {
@@ -559,6 +718,8 @@ struct CorsOptions {
     std::vector<std::string> ExposedHeaders;
     bool AllowCredentials = false;
     int MaxAgeSeconds = 600;
+    bool RejectInvalidPreflightRequests = false;
+    int PreflightFailureStatusCode = 403;
 };
 
 struct SecurityHeadersOptions {
@@ -572,12 +733,49 @@ struct SecurityHeadersOptions {
     std::string ContentSecurityPolicy;
 };
 
+struct HstsOptions {
+    bool Enable = true;
+    std::chrono::seconds MaxAge = std::chrono::seconds(31536000);
+    bool IncludeSubDomains = false;
+    bool Preload = false;
+    std::vector<std::string> ExcludedHosts = { "localhost", "127.0.0.1", "::1" };
+};
+
+struct HttpsRedirectionOptions {
+    int RedirectStatusCode = 307;
+    std::uint16_t HttpsPort = 0;
+    bool AllowEmptyHost = false;
+    std::string FailureDetail = "The request host is required for HTTPS redirection.";
+};
+
+struct HostFilteringOptions {
+    std::vector<std::string> AllowedHosts;
+    bool AllowEmptyHost = false;
+    int RejectedStatusCode = 400;
+    std::string FailureDetail = "The requested host is not allowed.";
+    std::string ItemKey = "HostFilteringRejected";
+};
+
 struct RequestLoggingOptions {
     bool IncludeQueryString = false;
     bool IncludeRemoteAddress = true;
     bool IncludeTraceIdentifier = true;
+    bool IncludeEndpoint = false;
     LogLevel SuccessLevel = LogLevel::Information;
     LogLevel FailureLevel = LogLevel::Warning;
+    std::vector<std::string> RedactedQueryParameters = {
+        "access_token",
+        "api_key",
+        "apikey",
+        "authorization",
+        "client_secret",
+        "code",
+        "password",
+        "refresh_token",
+        "secret",
+        "token"
+    };
+    std::string RedactedQueryValue = "[redacted]";
 };
 
 struct RequestIdOptions {
@@ -585,7 +783,20 @@ struct RequestIdOptions {
     std::string ResponseHeaderName = "X-Request-ID";
     bool TrustIncomingHeader = true;
     bool AddResponseHeader = true;
+    std::size_t MaxLength = 128;
     std::string ItemKey = "RequestId";
+};
+
+struct ServerTimingOptions {
+    bool Enable = true;
+    bool AddServerTimingHeader = true;
+    bool AddResponseTimeHeader = false;
+    std::string ServerTimingHeaderName = "Server-Timing";
+    std::string ResponseTimeHeaderName = "X-Response-Time";
+    std::string MetricName = "app";
+    std::string MetricDescription = "Application";
+    std::string ItemKey = "ServerTimingElapsedMilliseconds";
+    int DecimalPlaces = 3;
 };
 
 struct RateLimitOptions {
@@ -593,6 +804,8 @@ struct RateLimitOptions {
     std::chrono::seconds Window = std::chrono::seconds(60);
     RateLimitKeySelector KeySelector;
     int RejectedStatusCode = 429;
+    std::size_t MaxTrackedKeys = 10000;
+    std::size_t MaxKeyLength = 256;
     bool AddRateLimitHeaders = true;
     std::string RetryAfterHeaderName = "Retry-After";
     std::string LimitHeaderName = "X-RateLimit-Limit";
@@ -618,6 +831,7 @@ struct MetricsOptions {
     bool IncludeMethodCounters = true;
     bool IncludeStatusCodeCounters = true;
     bool IncludePathCounters = false;
+    bool UseMatchedEndpointPatternForPathCounters = true;
 };
 
 struct MetricsEndpointOptions {
@@ -642,10 +856,23 @@ struct HealthCheckResult {
 
 using HealthCheck = std::function<HealthCheckResult()>;
 
+struct HealthCheckRegistration {
+    std::string Name;
+    HealthCheck Check;
+    std::vector<std::string> Tags;
+};
+
+using HealthCheckPredicate = std::function<bool(const HealthCheckRegistration&)>;
+
 struct HealthCheckOptions {
     std::string Path = "/health";
     bool IncludeDetails = false;
+    bool IncludeApplicationState = true;
     bool TreatDegradedAsFailure = false;
+    bool TreatStoppingAsFailure = true;
+    int FailureStatusCode = 503;
+    std::vector<std::string> Tags;
+    HealthCheckPredicate Predicate;
 };
 
 struct OpenApiInfo {
@@ -658,6 +885,10 @@ struct OpenApiParameter {
     std::string Name;
     std::string In = "query";
     std::string SchemaType = "string";
+    std::string SchemaFormat;
+    bool IsArray = false;
+    std::string ItemsSchemaType;
+    std::string ItemsSchemaFormat;
     bool Required = false;
     std::string Description;
 };
@@ -708,6 +939,8 @@ struct BackgroundServiceOptions {
     std::string Name;
     BackgroundServiceCallback Execute;
     bool StopApplicationOnException = true;
+    std::chrono::milliseconds StopTimeout = std::chrono::seconds(30);
+    bool DetachOnStopTimeout = false;
 };
 
 struct WebApplicationOptions {
@@ -715,6 +948,7 @@ struct WebApplicationOptions {
     Logger Log;
     bool DetailedErrors = false;
     ProblemDetailsOptions ProblemDetails;
+    FormOptions Forms;
 };
 
 class UrlReservationManager final {
@@ -738,6 +972,7 @@ public:
 };
 
 class WebApplication;
+class RouteGroupBuilder;
 
 enum class WindowsServiceStartMode {
     Manual,
@@ -782,6 +1017,7 @@ public:
     WebApplicationBuilder& ConfigureFromEnvironment(std::string prefix = "CAPIWEB_");
     WebApplicationBuilder& ConfigureHttpSys(std::function<void(HttpSysOptions&)> configure);
     WebApplicationBuilder& ConfigureProblemDetails(std::function<void(ProblemDetailsOptions&)> configure);
+    WebApplicationBuilder& ConfigureFormOptions(std::function<void(FormOptions&)> configure);
     WebApplicationBuilder& ConfigureLogging(Logger logger);
     WebApplicationBuilder& UseDetailedErrors(bool enabled = true);
     WebApplicationBuilder& UseUrlAcl(UrlAclMode mode, std::wstring securityDescriptor = L"D:(A;;GX;;;WD)");
@@ -815,22 +1051,29 @@ public:
     WebApplication& UseProblemDetails();
     WebApplication& UseProblemDetails(ProblemDetailsOptions options);
     WebApplication& UseStaticFiles(StaticFileOptions options = {});
+    WebApplication& UseRequestDecompression(RequestDecompressionOptions options = {});
     WebApplication& UseResponseCompression(ResponseCompressionOptions options = {});
+    WebApplication& UseResponseCaching(ResponseCachingOptions options = {});
     WebApplication& UseAuthentication(AuthenticationOptions options);
     WebApplication& UseAuthorization(AuthorizationOptions options = {});
     WebApplication& UseCors(CorsOptions options = {});
     WebApplication& UseSecurityHeaders(SecurityHeadersOptions options = {});
+    WebApplication& UseHsts(HstsOptions options = {});
+    WebApplication& UseHttpsRedirection(HttpsRedirectionOptions options = {});
     WebApplication& UseForwardedHeaders(ForwardedHeadersOptions options = {});
+    WebApplication& UseHostFiltering(HostFilteringOptions options);
     WebApplication& UseRequestId(RequestIdOptions options = {});
+    WebApplication& UseServerTiming(ServerTimingOptions options = {});
     WebApplication& UseRateLimiter(RateLimitOptions options = {});
     WebApplication& UseRequestLogging(RequestLoggingOptions options = {});
     WebApplication& UseMetrics(MetricsOptions options = {});
     WebApplication& MapMetrics(MetricsEndpointOptions options = {});
-    WebApplication& AddHealthCheck(std::string name, HealthCheck check);
+    WebApplication& AddHealthCheck(std::string name, HealthCheck check, std::vector<std::string> tags = {});
     WebApplication& MapHealthChecks(HealthCheckOptions options = {});
     WebApplication& UseHealthChecks(HealthCheckOptions options = {});
     WebApplication& MapOpenApi(OpenApiOptions options = {});
     WebApplication& MapSwaggerUi(SwaggerUiOptions options = {});
+    RouteGroupBuilder MapGroup(std::string prefix);
     WebApplication& OnStarted(ApplicationCallback callback);
     WebApplication& OnStopping(ApplicationCallback callback);
     WebApplication& OnStopped(ApplicationCallback callback);
@@ -839,10 +1082,23 @@ public:
     WebApplication& MapMethods(std::initializer_list<std::string> methods, std::string pattern, EndpointHandler handler);
     WebApplication& MapMethods(std::vector<std::string> methods, std::string pattern, EndpointHandler handler);
     WebApplication& MapFallback(EndpointHandler handler);
+    std::optional<std::string> TryPathByName(std::string_view name, const ValueMap& routeValues = {}, const ValueMap& queryValues = {}) const;
+    std::string PathByName(std::string_view name, const ValueMap& routeValues = {}, const ValueMap& queryValues = {}) const;
+    std::optional<std::string> TryUrlByName(const HttpContext& context, std::string_view name, const ValueMap& routeValues = {}, const ValueMap& queryValues = {}) const;
+    std::optional<std::string> TryUrlByName(const HttpRequest& request, std::string_view name, const ValueMap& routeValues = {}, const ValueMap& queryValues = {}) const;
+    std::string UrlByName(const HttpContext& context, std::string_view name, const ValueMap& routeValues = {}, const ValueMap& queryValues = {}) const;
+    std::string UrlByName(const HttpRequest& request, std::string_view name, const ValueMap& routeValues = {}, const ValueMap& queryValues = {}) const;
     WebApplication& RequireAuthorization(std::string policy = {});
     WebApplication& RequireAuthorization(std::initializer_list<std::string> policies);
+    WebApplication& RequireAuthorization(AuthorizationPolicy policy);
+    WebApplication& RequireRole(std::string role);
+    WebApplication& RequireRoles(std::initializer_list<std::string> roles);
+    WebApplication& RequireRoles(std::vector<std::string> roles);
+    WebApplication& RequireClaim(std::string type);
+    WebApplication& RequireClaim(std::string type, std::string value);
     WebApplication& AllowAnonymous();
     WebApplication& ExcludeFromDescription();
+    WebApplication& AddEndpointFilter(EndpointFilter filter);
     WebApplication& WithName(std::string name);
     WebApplication& WithTags(std::initializer_list<std::string> tags);
     WebApplication& WithTags(std::vector<std::string> tags);
@@ -851,11 +1107,19 @@ public:
     WebApplication& WithParameter(OpenApiParameter parameter);
     WebApplication& WithQueryParameter(std::string name, std::string schemaType = "string", bool required = false, std::string description = {});
     WebApplication& WithHeaderParameter(std::string name, std::string schemaType = "string", bool required = false, std::string description = {});
+    WebApplication& WithQueryArrayParameter(std::string name, std::string itemSchemaType = "string", bool required = false, std::string description = {}, std::string itemSchemaFormat = {});
+    WebApplication& WithHeaderArrayParameter(std::string name, std::string itemSchemaType = "string", bool required = false, std::string description = {}, std::string itemSchemaFormat = {});
     WebApplication& Produces(int statusCode = 200, std::string contentType = "application/json", std::string description = {});
     WebApplication& Accepts(std::string contentType = "application/json", bool required = true, std::string description = {});
 
     template <class Handler>
     WebApplication& MapGet(std::string pattern, Handler&& handler);
+
+    template <class Handler>
+    WebApplication& MapHead(std::string pattern, Handler&& handler);
+
+    template <class Handler>
+    WebApplication& MapOptions(std::string pattern, Handler&& handler);
 
     template <class Handler>
     WebApplication& MapPost(std::string pattern, Handler&& handler);
@@ -887,8 +1151,77 @@ public:
     const WebApplicationOptions& Options() const noexcept;
 
 private:
+    friend class RouteGroupBuilder;
+
+    void EnsureCanConfigure(std::string_view operation) const;
+    void MarkLastEndpointAuthorizationRequirementsAsGroup();
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
+};
+
+class RouteGroupBuilder {
+public:
+    RouteGroupBuilder(WebApplication& app, std::string prefix);
+
+    const std::string& Prefix() const noexcept;
+    RouteGroupBuilder MapGroup(std::string prefix) const;
+
+    RouteGroupBuilder& RequireAuthorization(std::string policy = {});
+    RouteGroupBuilder& RequireAuthorization(std::initializer_list<std::string> policies);
+    RouteGroupBuilder& RequireAuthorization(AuthorizationPolicy policy);
+    RouteGroupBuilder& RequireRole(std::string role);
+    RouteGroupBuilder& RequireRoles(std::initializer_list<std::string> roles);
+    RouteGroupBuilder& RequireRoles(std::vector<std::string> roles);
+    RouteGroupBuilder& RequireClaim(std::string type);
+    RouteGroupBuilder& RequireClaim(std::string type, std::string value);
+    RouteGroupBuilder& AllowAnonymous();
+    RouteGroupBuilder& AddEndpointFilter(EndpointFilter filter);
+    RouteGroupBuilder& WithTags(std::initializer_list<std::string> tags);
+    RouteGroupBuilder& WithTags(std::vector<std::string> tags);
+
+    WebApplication& MapMethods(std::initializer_list<std::string> methods, std::string pattern, EndpointHandler handler);
+    WebApplication& MapMethods(std::vector<std::string> methods, std::string pattern, EndpointHandler handler);
+
+    template <class Handler>
+    WebApplication& MapGet(std::string pattern, Handler&& handler);
+
+    template <class Handler>
+    WebApplication& MapHead(std::string pattern, Handler&& handler);
+
+    template <class Handler>
+    WebApplication& MapOptions(std::string pattern, Handler&& handler);
+
+    template <class Handler>
+    WebApplication& MapPost(std::string pattern, Handler&& handler);
+
+    template <class Handler>
+    WebApplication& MapPut(std::string pattern, Handler&& handler);
+
+    template <class Handler>
+    WebApplication& MapPatch(std::string pattern, Handler&& handler);
+
+    template <class Handler>
+    WebApplication& MapDelete(std::string pattern, Handler&& handler);
+
+    template <class Handler>
+    WebApplication& MapAny(std::string pattern, Handler&& handler);
+
+private:
+    WebApplication& App() const;
+    std::string FullPattern(std::string pattern) const;
+    WebApplication& ApplyGroupMetadata(WebApplication& app) const;
+    AuthorizationPolicy& LocalAuthorizationRequirement();
+
+    WebApplication* app_ = nullptr;
+    std::string prefix_;
+    bool requireAuthorization_ = false;
+    bool allowAnonymous_ = false;
+    std::vector<std::string> authorizationPolicies_;
+    std::vector<AuthorizationPolicy> authorizationRequirements_;
+    std::size_t inheritedAuthorizationRequirementCount_ = 0;
+    std::vector<EndpointFilter> endpointFilters_;
+    std::vector<std::string> tags_;
 };
 
 namespace detail {
@@ -947,6 +1280,22 @@ inline bool BindingEqualsIgnoreCase(std::string_view left, std::string_view righ
     return left.size() == right.size() && BindingToLower(left) == BindingToLower(right);
 }
 
+inline std::string JsonBindingContentTypeMessage(const HttpRequest& request, std::string_view label) {
+    std::string contentType = request.Header("Content-Type");
+    if (BindingTrim(contentType).empty()) {
+        return "Request Content-Type is required to bind " + std::string(label) +
+            ". Supported content types: application/json, application/*+json.";
+    }
+    return "Unsupported request Content-Type '" + contentType + "' while binding " + std::string(label) +
+        ". Supported content types: application/json, application/*+json.";
+}
+
+inline void RequireJsonContentType(const HttpRequest& request, std::string_view label) {
+    if (!request.HasJsonContentType()) {
+        throw UnsupportedMediaTypeBindingException(JsonBindingContentTypeMessage(request, label));
+    }
+}
+
 template <class T>
 struct IsOptional : std::false_type {
 };
@@ -963,6 +1312,37 @@ template <class T>
 using OptionalValueType = typename IsOptional<std::decay_t<T>>::ValueType;
 
 template <class T>
+struct IsVector : std::false_type {
+};
+
+template <class T, class Allocator>
+struct IsVector<std::vector<T, Allocator>> : std::true_type {
+    using ValueType = T;
+};
+
+template <class T>
+inline constexpr bool IsVectorV = IsVector<std::decay_t<T>>::value;
+
+template <class T>
+using VectorValueType = typename IsVector<std::decay_t<T>>::ValueType;
+
+template <class T>
+struct IsTextBindable
+    : std::bool_constant<
+        std::is_same_v<std::decay_t<T>, std::string> ||
+        std::is_same_v<std::decay_t<T>, bool> ||
+        (std::is_integral_v<std::decay_t<T>> && !std::is_same_v<std::decay_t<T>, bool>) ||
+        std::is_floating_point_v<std::decay_t<T>>> {
+};
+
+template <class T>
+struct IsTextBindable<std::optional<T>> : IsTextBindable<T> {
+};
+
+template <class T>
+inline constexpr bool IsTextBindableV = IsTextBindable<std::decay_t<T>>::value;
+
+template <class T>
 T MissingBindingValue(const BindingParameter<T>& binding, std::string_view label) {
     if (binding.HasDefault()) {
         return binding.DefaultValue();
@@ -972,6 +1352,14 @@ T MissingBindingValue(const BindingParameter<T>& binding, std::string_view label
     } else {
         throw ParameterBindingException("Missing required " + std::string(label) + " parameter '" + binding.Name() + "'.");
     }
+}
+
+template <class T>
+T MissingVectorBindingValue(const BindingParameter<T>& binding) {
+    if (binding.HasDefault()) {
+        return binding.DefaultValue();
+    }
+    return {};
 }
 
 template <class T>
@@ -1013,6 +1401,26 @@ T ConvertTextValue(std::string_view text, std::string_view label) {
 }
 
 template <class T>
+T ConvertTextVectorBindingValue(const std::vector<std::string>& values, std::string_view name, std::string_view source) {
+    if constexpr (IsVectorV<T>) {
+        using Element = VectorValueType<T>;
+        if constexpr (IsTextBindableV<Element>) {
+            T result;
+            result.reserve(values.size());
+            for (const std::string& value : values) {
+                result.push_back(ConvertTextValue<Element>(value, name));
+            }
+            return result;
+        } else {
+            throw ParameterBindingException(
+                "Parameter '" + std::string(name) + "' cannot be bound from " + std::string(source) + ".");
+        }
+    } else {
+        static_assert(AlwaysFalse<T>, "ConvertTextVectorBindingValue requires std::vector<T>.");
+    }
+}
+
+template <class T>
 T ConvertJsonValue(const System::Text::Json::JsonElement& element, std::string_view label) {
     using Decayed = std::decay_t<T>;
     if constexpr (IsOptionalV<Decayed>) {
@@ -1022,6 +1430,16 @@ T ConvertJsonValue(const System::Text::Json::JsonElement& element, std::string_v
             return std::nullopt;
         }
         return ConvertJsonValue<Inner>(element, label);
+    } else if constexpr (IsVectorV<Decayed>) {
+        using Element = VectorValueType<Decayed>;
+        if (element.ValueKind() != System::Text::Json::JsonValueKind::Array) {
+            throw ParameterBindingException("JSON parameter '" + std::string(label) + "' must be an array.");
+        }
+        Decayed result;
+        for (const auto& item : element.EnumerateArray()) {
+            result.push_back(ConvertJsonValue<Element>(item, label));
+        }
+        return result;
     } else if constexpr (std::is_same_v<Decayed, System::Text::Json::JsonElement>) {
         return element;
     } else if constexpr (std::is_same_v<Decayed, std::string>) {
@@ -1061,38 +1479,114 @@ T ConvertJsonValue(const System::Text::Json::JsonElement& element, std::string_v
 }
 
 template <class T>
+T ConvertTextBindingValue(std::string_view text, std::string_view name, std::string_view source) {
+    if constexpr (IsTextBindableV<T>) {
+        return ConvertTextValue<T>(text, name);
+    } else {
+        throw ParameterBindingException(
+            "Parameter '" + std::string(name) + "' cannot be bound from " + std::string(source) + ".");
+    }
+}
+
+template <class T>
 T ResolveBindingValue(const BindingParameter<T>& binding, HttpContext& context) {
     const std::string& name = binding.Name();
     switch (binding.Source()) {
     case BindingSource::Route: {
-        auto it = context.Request().RouteValues().find(name);
-        if (it == context.Request().RouteValues().end()) {
-            return MissingBindingValue(binding, "route");
+        if constexpr (IsVectorV<T>) {
+            auto it = context.Request().RouteValues().find(name);
+            if (it == context.Request().RouteValues().end()) {
+                return MissingVectorBindingValue(binding);
+            }
+            std::vector<std::string> values = { it->second };
+            return ConvertTextVectorBindingValue<T>(values, name, "route");
+        } else {
+            auto it = context.Request().RouteValues().find(name);
+            if (it == context.Request().RouteValues().end()) {
+                return MissingBindingValue(binding, "route");
+            }
+            return ConvertTextBindingValue<T>(it->second, name, "route");
         }
-        return ConvertTextValue<T>(it->second, name);
     }
     case BindingSource::Query: {
-        auto it = context.Request().Query().find(name);
-        if (it == context.Request().Query().end()) {
-            return MissingBindingValue(binding, "query");
+        if constexpr (IsVectorV<T>) {
+            const ValueListMap& values = context.Request().QueryValues();
+            auto it = values.find(name);
+            if (it == values.end()) {
+                return MissingVectorBindingValue(binding);
+            }
+            return ConvertTextVectorBindingValue<T>(it->second, name, "query");
+        } else {
+            auto it = context.Request().Query().find(name);
+            if (it == context.Request().Query().end()) {
+                return MissingBindingValue(binding, "query");
+            }
+            return ConvertTextBindingValue<T>(it->second, name, "query");
         }
-        return ConvertTextValue<T>(it->second, name);
     }
     case BindingSource::Header: {
-        auto value = context.Request().Headers().TryGet(name);
-        if (!value) {
-            return MissingBindingValue(binding, "header");
+        if constexpr (IsVectorV<T>) {
+            std::vector<std::string> values = context.Request().Headers().GetValues(name);
+            if (values.empty()) {
+                return MissingVectorBindingValue(binding);
+            }
+            return ConvertTextVectorBindingValue<T>(values, name, "header");
+        } else {
+            auto value = context.Request().Headers().TryGet(name);
+            if (!value) {
+                return MissingBindingValue(binding, "header");
+            }
+            return ConvertTextBindingValue<T>(*value, name, "header");
         }
-        return ConvertTextValue<T>(*value, name);
+    }
+    case BindingSource::Cookie: {
+        const ValueMap& cookies = context.Request().Cookies();
+        if constexpr (IsVectorV<T>) {
+            auto it = cookies.find(name);
+            if (it == cookies.end()) {
+                return MissingVectorBindingValue(binding);
+            }
+            std::vector<std::string> values = { it->second };
+            return ConvertTextVectorBindingValue<T>(values, name, "cookie");
+        } else {
+            auto it = cookies.find(name);
+            if (it == cookies.end()) {
+                return MissingBindingValue(binding, "cookie");
+            }
+            return ConvertTextBindingValue<T>(it->second, name, "cookie");
+        }
+    }
+    case BindingSource::Form: {
+        if (!context.Request().HasFormContentType()) {
+            throw UnsupportedMediaTypeBindingException(
+                "Request Content-Type must be application/x-www-form-urlencoded or multipart/form-data to bind form parameter '" + name + "'.");
+        }
+        if constexpr (IsVectorV<T>) {
+            const ValueListMap& values = context.Request().FormValues();
+            auto it = values.find(name);
+            if (it == values.end()) {
+                return MissingVectorBindingValue(binding);
+            }
+            return ConvertTextVectorBindingValue<T>(it->second, name, "form");
+        } else {
+            const ValueMap& form = context.Request().Form();
+            auto it = form.find(name);
+            if (it == form.end()) {
+                return MissingBindingValue(binding, "form");
+            }
+            return ConvertTextBindingValue<T>(it->second, name, "form");
+        }
     }
     case BindingSource::Body: {
         if constexpr (std::is_same_v<std::decay_t<T>, std::string>) {
             return context.Request().Body();
         } else {
+            RequireJsonContentType(context.Request(), "JSON request body");
             return ConvertJsonValue<T>(context.Request().Json(), "body");
         }
     }
     case BindingSource::JsonProperty: {
+        RequireJsonContentType(context.Request(), "JSON property '" + name + "'");
         System::Text::Json::JsonElement root = context.Request().Json();
         if (root.ValueKind() != System::Text::Json::JsonValueKind::Object) {
             throw ParameterBindingException("JSON request body must be an object to bind property '" + name + "'.");
@@ -1189,6 +1683,8 @@ EndpointHandler MakeBoundEndpointHandler(Handler&& handler, Bindings&&... bindin
                     return ToHttpResult(fn(ResolveBindingValue(currentBindings, context)...));
                 }
             }, bindingTuple);
+        } catch (const UnsupportedMediaTypeBindingException& ex) {
+            return Results::Problem("Unsupported Media Type", ex.what(), 415);
         } catch (const ParameterBindingException& ex) {
             return Results::BadRequest(ex.what());
         } catch (const System::Text::Json::JsonException& ex) {
@@ -1210,7 +1706,37 @@ WebApplication& WebApplication::MapGet(std::string pattern, Handler&& handler) {
 }
 
 template <class Handler>
+WebApplication& RouteGroupBuilder::MapGet(std::string pattern, Handler&& handler) {
+    return MapMethods({ "GET" }, std::move(pattern), detail::MakeEndpointHandler(std::forward<Handler>(handler)));
+}
+
+template <class Handler>
+WebApplication& WebApplication::MapHead(std::string pattern, Handler&& handler) {
+    return MapMethods({ "HEAD" }, std::move(pattern), detail::MakeEndpointHandler(std::forward<Handler>(handler)));
+}
+
+template <class Handler>
+WebApplication& RouteGroupBuilder::MapHead(std::string pattern, Handler&& handler) {
+    return MapMethods({ "HEAD" }, std::move(pattern), detail::MakeEndpointHandler(std::forward<Handler>(handler)));
+}
+
+template <class Handler>
+WebApplication& WebApplication::MapOptions(std::string pattern, Handler&& handler) {
+    return MapMethods({ "OPTIONS" }, std::move(pattern), detail::MakeEndpointHandler(std::forward<Handler>(handler)));
+}
+
+template <class Handler>
+WebApplication& RouteGroupBuilder::MapOptions(std::string pattern, Handler&& handler) {
+    return MapMethods({ "OPTIONS" }, std::move(pattern), detail::MakeEndpointHandler(std::forward<Handler>(handler)));
+}
+
+template <class Handler>
 WebApplication& WebApplication::MapPost(std::string pattern, Handler&& handler) {
+    return MapMethods({ "POST" }, std::move(pattern), detail::MakeEndpointHandler(std::forward<Handler>(handler)));
+}
+
+template <class Handler>
+WebApplication& RouteGroupBuilder::MapPost(std::string pattern, Handler&& handler) {
     return MapMethods({ "POST" }, std::move(pattern), detail::MakeEndpointHandler(std::forward<Handler>(handler)));
 }
 
@@ -1220,7 +1746,17 @@ WebApplication& WebApplication::MapPut(std::string pattern, Handler&& handler) {
 }
 
 template <class Handler>
+WebApplication& RouteGroupBuilder::MapPut(std::string pattern, Handler&& handler) {
+    return MapMethods({ "PUT" }, std::move(pattern), detail::MakeEndpointHandler(std::forward<Handler>(handler)));
+}
+
+template <class Handler>
 WebApplication& WebApplication::MapPatch(std::string pattern, Handler&& handler) {
+    return MapMethods({ "PATCH" }, std::move(pattern), detail::MakeEndpointHandler(std::forward<Handler>(handler)));
+}
+
+template <class Handler>
+WebApplication& RouteGroupBuilder::MapPatch(std::string pattern, Handler&& handler) {
     return MapMethods({ "PATCH" }, std::move(pattern), detail::MakeEndpointHandler(std::forward<Handler>(handler)));
 }
 
@@ -1230,7 +1766,17 @@ WebApplication& WebApplication::MapDelete(std::string pattern, Handler&& handler
 }
 
 template <class Handler>
+WebApplication& RouteGroupBuilder::MapDelete(std::string pattern, Handler&& handler) {
+    return MapMethods({ "DELETE" }, std::move(pattern), detail::MakeEndpointHandler(std::forward<Handler>(handler)));
+}
+
+template <class Handler>
 WebApplication& WebApplication::MapAny(std::string pattern, Handler&& handler) {
+    return MapMethods({}, std::move(pattern), detail::MakeEndpointHandler(std::forward<Handler>(handler)));
+}
+
+template <class Handler>
+WebApplication& RouteGroupBuilder::MapAny(std::string pattern, Handler&& handler) {
     return MapMethods({}, std::move(pattern), detail::MakeEndpointHandler(std::forward<Handler>(handler)));
 }
 

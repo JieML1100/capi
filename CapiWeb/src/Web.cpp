@@ -16,9 +16,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cctype>
+#include <cmath>
+#include <cstdlib>
 #include <ctime>
 #include <cwctype>
 #include <cstring>
@@ -30,6 +33,7 @@
 #include <mutex>
 #include <sstream>
 #include <exception>
+#include <stdexcept>
 #include <thread>
 
 #include <zlib.h>
@@ -69,6 +73,15 @@ std::string FormatWin32Message(unsigned long errorCode) {
         message = "Windows error " + std::to_string(errorCode);
     }
     return message;
+}
+
+std::string FormatWin32Error(unsigned long errorCode) {
+    std::ostringstream stream;
+    stream << FormatWin32Message(errorCode)
+        << " (" << errorCode
+        << ", 0x" << std::uppercase << std::hex << std::setw(8) << std::setfill('0') << errorCode
+        << ")";
+    return stream.str();
 }
 
 std::wstring Utf8ToWide(std::string_view value) {
@@ -156,8 +169,34 @@ void ValidateHeaderName(std::string_view name, std::string_view optionName) {
     }
 }
 
+bool ContainsUnsafeHeaderValueCharacters(std::string_view value) {
+    for (unsigned char ch : value) {
+        if ((ch < 32 && ch != '\t') || ch == 127) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void ValidateHeaderValue(std::string_view value, std::string_view optionName) {
+    if (ContainsUnsafeHeaderValueCharacters(value)) {
+        throw std::invalid_argument(std::string(optionName) + " cannot contain CR/LF or other control characters.");
+    }
+}
+
+bool IsAcceptableRequestIdValue(std::string_view value, std::size_t maxLength) {
+    if (value.empty()) {
+        return false;
+    }
+    if (maxLength != 0 && value.size() > maxLength) {
+        return false;
+    }
+    return !ContainsUnsafeHeaderValueCharacters(value);
+}
+
 std::string Trim(std::string value);
 bool EqualsIgnoreCase(std::string_view left, std::string_view right);
+bool StartsWithIgnoreCase(std::string_view value, std::string_view prefix);
 
 std::string StripQuotes(std::string value) {
     value = Trim(std::move(value));
@@ -219,10 +258,6 @@ std::optional<std::string> SelectForwardedValue(std::string_view headerValue, st
     return values[values.size() - forwardLimit];
 }
 
-bool ContainsUnsafeHeaderValueCharacters(std::string_view value) {
-    return value.find('\r') != std::string_view::npos || value.find('\n') != std::string_view::npos;
-}
-
 std::string NormalizeForwardedScheme(std::string value) {
     value = ToLowerAscii(StripQuotes(std::move(value)));
     if (value.empty()) {
@@ -233,6 +268,219 @@ std::string NormalizeForwardedScheme(std::string value) {
         if (!valid) {
             return {};
         }
+    }
+    return value;
+}
+
+struct ParsedHost {
+    std::string Name;
+    std::string Port;
+    bool HasPort = false;
+};
+
+struct HostFilterPattern {
+    bool MatchAny = false;
+    bool Wildcard = false;
+    ParsedHost Host;
+};
+
+bool IsDecimalPort(std::string_view value) {
+    return !value.empty() && std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+        return std::isdigit(ch) != 0;
+    });
+}
+
+bool ContainsInvalidHostNameCharacters(std::string_view value) {
+    for (unsigned char ch : value) {
+        if (ch <= 32 || ch == 127 ||
+            ch == '/' || ch == '\\' || ch == '@' ||
+            ch == '[' || ch == ']' || ch == ',') {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::optional<ParsedHost> TryParseHostForFiltering(std::string value) {
+    value = ToLowerAscii(StripQuotes(std::move(value)));
+    if (value.empty() || ContainsUnsafeHeaderValueCharacters(value)) {
+        return std::nullopt;
+    }
+
+    ParsedHost host;
+    if (value.front() == '[') {
+        std::size_t close = value.find(']');
+        if (close == std::string::npos || close == 1) {
+            return std::nullopt;
+        }
+        host.Name = value.substr(1, close - 1);
+        std::string rest = value.substr(close + 1);
+        if (!rest.empty()) {
+            if (rest.front() != ':' || !IsDecimalPort(rest.substr(1))) {
+                return std::nullopt;
+            }
+            host.HasPort = true;
+            host.Port = rest.substr(1);
+        }
+    } else {
+        std::size_t firstColon = value.find(':');
+        std::size_t lastColon = value.rfind(':');
+        if (firstColon != std::string::npos && firstColon == lastColon && IsDecimalPort(value.substr(firstColon + 1))) {
+            host.Name = value.substr(0, firstColon);
+            host.HasPort = true;
+            host.Port = value.substr(firstColon + 1);
+        } else {
+            host.Name = value;
+        }
+    }
+
+    while (host.Name.size() > 1 && host.Name.back() == '.') {
+        host.Name.pop_back();
+    }
+    if (host.Name.empty() || ContainsInvalidHostNameCharacters(host.Name)) {
+        return std::nullopt;
+    }
+    return host;
+}
+
+std::vector<HostFilterPattern> BuildHostFilterPatterns(const std::vector<std::string>& allowedHosts, std::string_view optionName) {
+    std::vector<HostFilterPattern> patterns;
+    for (const std::string& rawHost : allowedHosts) {
+        std::string host = ToLowerAscii(StripQuotes(rawHost));
+        if (host.empty()) {
+            continue;
+        }
+        if (host == "*") {
+            patterns.push_back(HostFilterPattern{ true, false, {} });
+            continue;
+        }
+
+        HostFilterPattern pattern;
+        if (StartsWithIgnoreCase(host, "*.")) {
+            pattern.Wildcard = true;
+            host = host.substr(2);
+        }
+        auto parsed = TryParseHostForFiltering(host);
+        if (!parsed) {
+            throw std::invalid_argument(std::string(optionName) + " contains an invalid host pattern.");
+        }
+        pattern.Host = std::move(*parsed);
+        patterns.push_back(std::move(pattern));
+    }
+    return patterns;
+}
+
+bool HostMatchesPattern(const ParsedHost& host, const HostFilterPattern& pattern) {
+    if (pattern.MatchAny) {
+        return true;
+    }
+    if (pattern.Host.HasPort && (!host.HasPort || host.Port != pattern.Host.Port)) {
+        return false;
+    }
+    if (!pattern.Wildcard) {
+        return EqualsIgnoreCase(host.Name, pattern.Host.Name);
+    }
+    if (host.Name.size() <= pattern.Host.Name.size()) {
+        return false;
+    }
+    std::size_t suffixStart = host.Name.size() - pattern.Host.Name.size();
+    return host.Name[suffixStart - 1] == '.' &&
+        EqualsIgnoreCase(std::string_view(host.Name).substr(suffixStart), pattern.Host.Name);
+}
+
+bool IsHostAllowed(std::string host, const std::vector<HostFilterPattern>& patterns, bool allowEmptyHost) {
+    host = Trim(std::move(host));
+    if (host.empty()) {
+        return allowEmptyHost;
+    }
+    auto parsed = TryParseHostForFiltering(std::move(host));
+    if (!parsed) {
+        return false;
+    }
+    return std::any_of(patterns.begin(), patterns.end(), [&parsed](const HostFilterPattern& pattern) {
+        return HostMatchesPattern(*parsed, pattern);
+    });
+}
+
+std::string HostForHeader(const ParsedHost& host) {
+    std::string result;
+    if (host.Name.find(':') != std::string::npos) {
+        result = "[" + host.Name + "]";
+    } else {
+        result = host.Name;
+    }
+    if (host.HasPort) {
+        result += ":" + host.Port;
+    }
+    return result;
+}
+
+std::string HostForHttpsRedirect(ParsedHost host, std::uint16_t httpsPort) {
+    if (httpsPort != 0) {
+        host.HasPort = httpsPort != 443;
+        host.Port = host.HasPort ? std::to_string(httpsPort) : std::string();
+    }
+    return HostForHeader(host);
+}
+
+std::optional<std::string> TryBuildAbsoluteUrl(const HttpRequest& request, std::string path, std::string* error) {
+    std::string scheme = NormalizeForwardedScheme(request.Scheme());
+    if (!EqualsIgnoreCase(scheme, "http") && !EqualsIgnoreCase(scheme, "https")) {
+        if (error != nullptr) {
+            *error = "Request scheme must be http or https to generate an absolute URL.";
+        }
+        return std::nullopt;
+    }
+
+    std::string host = request.Host().empty()
+        ? request.Header("Host")
+        : request.Host();
+    if (Trim(host).empty()) {
+        if (error != nullptr) {
+            *error = "Request host is required to generate an absolute URL.";
+        }
+        return std::nullopt;
+    }
+
+    auto parsedHost = TryParseHostForFiltering(std::move(host));
+    if (!parsedHost) {
+        if (error != nullptr) {
+            *error = "Request host is invalid and cannot be used to generate an absolute URL.";
+        }
+        return std::nullopt;
+    }
+
+    return scheme + "://" + HostForHeader(*parsedHost) + std::move(path);
+}
+
+std::string RequestTargetForRedirect(const HttpRequest& request) {
+    std::string target = request.Path().empty() ? "/" : request.Path();
+    if (!request.QueryString().empty()) {
+        target += request.QueryString().front() == '?' ? request.QueryString() : "?" + request.QueryString();
+    }
+    return target;
+}
+
+bool IsHttpsRedirectStatusCode(int statusCode) {
+    return statusCode == 301 ||
+        statusCode == 302 ||
+        statusCode == 307 ||
+        statusCode == 308;
+}
+
+bool IsHstsExcludedHost(const ParsedHost& host, const std::vector<HostFilterPattern>& excludedHosts) {
+    return std::any_of(excludedHosts.begin(), excludedHosts.end(), [&host](const HostFilterPattern& pattern) {
+        return HostMatchesPattern(host, pattern);
+    });
+}
+
+std::string CreateStrictTransportSecurityValue(const HstsOptions& options) {
+    std::string value = "max-age=" + std::to_string(options.MaxAge.count());
+    if (options.IncludeSubDomains) {
+        value += "; includeSubDomains";
+    }
+    if (options.Preload) {
+        value += "; preload";
     }
     return value;
 }
@@ -388,8 +636,59 @@ std::string UrlDecode(std::string_view value, bool plusAsSpace) {
     return result;
 }
 
-ValueMap ParseQueryString(std::string_view queryString) {
-    ValueMap values;
+bool IsUrlUnreserved(unsigned char ch) {
+    return (ch >= 'A' && ch <= 'Z') ||
+        (ch >= 'a' && ch <= 'z') ||
+        (ch >= '0' && ch <= '9') ||
+        ch == '-' ||
+        ch == '.' ||
+        ch == '_' ||
+        ch == '~';
+}
+
+std::string UrlEncode(std::string_view value) {
+    static constexpr char Hex[] = "0123456789ABCDEF";
+    std::string result;
+    result.reserve(value.size());
+    for (unsigned char ch : value) {
+        if (IsUrlUnreserved(ch)) {
+            result.push_back(static_cast<char>(ch));
+            continue;
+        }
+        result.push_back('%');
+        result.push_back(Hex[(ch >> 4) & 0x0F]);
+        result.push_back(Hex[ch & 0x0F]);
+    }
+    return result;
+}
+
+std::string UrlEncodeCatchAllPath(std::string_view value) {
+    while (!value.empty() && value.front() == '/') {
+        value.remove_prefix(1);
+    }
+
+    std::string result;
+    std::size_t position = 0;
+    while (position <= value.size()) {
+        std::size_t slash = value.find('/', position);
+        std::string_view segment = value.substr(position, slash == std::string_view::npos ? std::string_view::npos : slash - position);
+        result += UrlEncode(segment);
+        if (slash == std::string_view::npos) {
+            break;
+        }
+        result.push_back('/');
+        position = slash + 1;
+    }
+    return result;
+}
+
+struct ParsedValueCollection {
+    ValueMap Values;
+    ValueListMap ValueLists;
+};
+
+ParsedValueCollection ParseUrlEncodedValues(std::string_view queryString) {
+    ParsedValueCollection parsed;
     if (!queryString.empty() && queryString.front() == '?') {
         queryString.remove_prefix(1);
     }
@@ -406,14 +705,414 @@ ValueMap ParseQueryString(std::string_view queryString) {
             std::string value = equals == std::string_view::npos
                 ? std::string()
                 : UrlDecode(pair.substr(equals + 1), true);
-            values[std::move(key)] = std::move(value);
+            parsed.ValueLists[key].push_back(value);
+            parsed.Values[std::move(key)] = std::move(value);
         }
         if (amp == queryString.size()) {
             break;
         }
         pos = amp + 1;
     }
-    return values;
+    return parsed;
+}
+
+void EnsureFormValueCount(std::size_t count, const FormOptions& options) {
+    if (options.ValueCountLimit != 0 && count > options.ValueCountLimit) {
+        throw ParameterBindingException("Form value count exceeds FormOptions::ValueCountLimit.");
+    }
+}
+
+void EnsureFormKeyLength(std::string_view key, const FormOptions& options) {
+    if (options.KeyLengthLimit != 0 && key.size() > options.KeyLengthLimit) {
+        throw ParameterBindingException("Form key length exceeds FormOptions::KeyLengthLimit.");
+    }
+}
+
+void EnsureFormValueLength(std::string_view value, const FormOptions& options) {
+    if (options.ValueLengthLimit != 0 && value.size() > options.ValueLengthLimit) {
+        throw ParameterBindingException("Form value length exceeds FormOptions::ValueLengthLimit.");
+    }
+}
+
+ParsedValueCollection ParseFormUrlEncoded(std::string_view body, const FormOptions& options) {
+    ParsedValueCollection parsed;
+    std::size_t valueCount = 0;
+    std::size_t pos = 0;
+    while (pos <= body.size()) {
+        std::size_t amp = body.find('&', pos);
+        if (amp == std::string_view::npos) {
+            amp = body.size();
+        }
+        std::string_view pair = body.substr(pos, amp - pos);
+        if (!pair.empty()) {
+            std::size_t equals = pair.find('=');
+            std::string key = UrlDecode(pair.substr(0, equals), true);
+            std::string value = equals == std::string_view::npos
+                ? std::string()
+                : UrlDecode(pair.substr(equals + 1), true);
+            EnsureFormValueCount(++valueCount, options);
+            EnsureFormKeyLength(key, options);
+            EnsureFormValueLength(value, options);
+            parsed.ValueLists[key].push_back(value);
+            parsed.Values[std::move(key)] = std::move(value);
+        }
+        if (amp == body.size()) {
+            break;
+        }
+        pos = amp + 1;
+    }
+    return parsed;
+}
+
+ValueMap ParseQueryString(std::string_view queryString) {
+    return ParseUrlEncodedValues(queryString).Values;
+}
+
+std::string SanitizeLogText(std::string value) {
+    for (char& ch : value) {
+        unsigned char uch = static_cast<unsigned char>(ch);
+        if (uch < 32 || uch == 127) {
+            ch = '?';
+        }
+    }
+    return value;
+}
+
+bool ShouldRedactLoggedQueryParameter(std::string_view encodedName, const RequestLoggingOptions& options) {
+    if (options.RedactedQueryParameters.empty()) {
+        return false;
+    }
+    std::string decodedName = UrlDecode(encodedName, true);
+    return ContainsTokenIgnoreCase(options.RedactedQueryParameters, decodedName);
+}
+
+std::string RedactLoggedQueryString(std::string_view queryString, const RequestLoggingOptions& options) {
+    bool hasQuestionMark = !queryString.empty() && queryString.front() == '?';
+    if (hasQuestionMark) {
+        queryString.remove_prefix(1);
+    }
+
+    std::string result;
+    result.reserve(queryString.size() + (hasQuestionMark ? 1 : 0));
+    if (hasQuestionMark) {
+        result.push_back('?');
+    }
+
+    std::size_t position = 0;
+    while (position <= queryString.size()) {
+        std::size_t amp = queryString.find('&', position);
+        if (amp == std::string_view::npos) {
+            amp = queryString.size();
+        }
+        if (position != 0) {
+            result.push_back('&');
+        }
+
+        std::string_view pair = queryString.substr(position, amp - position);
+        if (!pair.empty()) {
+            std::size_t equals = pair.find('=');
+            std::string_view name = pair.substr(0, equals);
+            if (ShouldRedactLoggedQueryParameter(name, options)) {
+                result.append(name);
+                result.push_back('=');
+                result.append(options.RedactedQueryValue);
+            } else {
+                result.append(pair);
+            }
+        }
+
+        if (amp == queryString.size()) {
+            break;
+        }
+        position = amp + 1;
+    }
+
+    return result;
+}
+
+std::string BuildLoggedRequestTarget(const HttpRequest& request, const RequestLoggingOptions& options) {
+    std::string target = request.Path();
+    if (options.IncludeQueryString && !request.QueryString().empty()) {
+        std::string queryString = RedactLoggedQueryString(request.QueryString(), options);
+        target += queryString.empty() || queryString.front() == '?' ? queryString : "?" + queryString;
+    }
+    return SanitizeLogText(std::move(target));
+}
+
+struct MultipartFormData {
+    ValueMap Fields;
+    ValueListMap FieldValues;
+    std::vector<MultipartFile> Files;
+};
+
+std::vector<std::string> SplitSemicolonSeparatedHeader(std::string_view value) {
+    std::vector<std::string> result;
+    std::size_t start = 0;
+    bool inQuotes = false;
+    bool escaped = false;
+    for (std::size_t index = 0; index < value.size(); ++index) {
+        char ch = value[index];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (inQuotes && ch == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (ch == '"') {
+            inQuotes = !inQuotes;
+        } else if (ch == ';' && !inQuotes) {
+            result.push_back(Trim(std::string(value.substr(start, index - start))));
+            start = index + 1;
+        }
+    }
+    result.push_back(Trim(std::string(value.substr(start))));
+    return result;
+}
+
+std::string DecodeHeaderParameterValue(std::string value) {
+    value = Trim(std::move(value));
+    if (value.size() < 2 || value.front() != '"' || value.back() != '"') {
+        return value;
+    }
+
+    std::string result;
+    result.reserve(value.size() - 2);
+    bool escaped = false;
+    for (std::size_t index = 1; index + 1 < value.size(); ++index) {
+        char ch = value[index];
+        if (escaped) {
+            result.push_back(ch);
+            escaped = false;
+        } else if (ch == '\\') {
+            escaped = true;
+        } else {
+            result.push_back(ch);
+        }
+    }
+    return result;
+}
+
+std::unordered_map<std::string, std::string> ParseHeaderParameters(std::string_view value) {
+    std::unordered_map<std::string, std::string> parameters;
+    std::vector<std::string> parts = SplitSemicolonSeparatedHeader(value);
+    for (std::size_t index = 1; index < parts.size(); ++index) {
+        std::string part = Trim(std::move(parts[index]));
+        std::size_t equals = part.find('=');
+        if (equals == std::string::npos) {
+            continue;
+        }
+        std::string name = ToLowerAscii(Trim(part.substr(0, equals)));
+        std::string parameterValue = DecodeHeaderParameterValue(part.substr(equals + 1));
+        if (!name.empty()) {
+            parameters[std::move(name)] = std::move(parameterValue);
+        }
+    }
+    return parameters;
+}
+
+std::string HeaderMainValue(std::string_view value) {
+    std::vector<std::string> parts = SplitSemicolonSeparatedHeader(value);
+    return parts.empty() ? std::string() : ToLowerAscii(Trim(std::move(parts.front())));
+}
+
+std::optional<std::string> HeaderParameter(std::string_view value, std::string_view name) {
+    auto parameters = ParseHeaderParameters(value);
+    auto it = parameters.find(ToLowerAscii(std::string(name)));
+    if (it == parameters.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+std::string MultipartBoundaryFromContentType(std::string_view contentType, const FormOptions& options) {
+    auto boundary = HeaderParameter(contentType, "boundary");
+    if (!boundary || boundary->empty()) {
+        throw ParameterBindingException("multipart/form-data boundary is missing.");
+    }
+    if (boundary->find('\r') != std::string::npos || boundary->find('\n') != std::string::npos) {
+        throw ParameterBindingException("multipart/form-data boundary contains invalid characters.");
+    }
+    if (options.MultipartBoundaryLengthLimit != 0 && boundary->size() > options.MultipartBoundaryLengthLimit) {
+        throw ParameterBindingException("multipart/form-data boundary length exceeds FormOptions::MultipartBoundaryLengthLimit.");
+    }
+    return *boundary;
+}
+
+bool StartsWithAt(std::string_view value, std::size_t position, std::string_view prefix) {
+    return position <= value.size() &&
+        prefix.size() <= value.size() - position &&
+        value.compare(position, prefix.size(), prefix) == 0;
+}
+
+std::size_t ConsumeLineBreak(std::string_view value, std::size_t position) {
+    if (StartsWithAt(value, position, "\r\n")) {
+        return position + 2;
+    }
+    if (StartsWithAt(value, position, "\n")) {
+        return position + 1;
+    }
+    return std::string_view::npos;
+}
+
+std::pair<std::size_t, std::size_t> FindMultipartHeaderEnd(std::string_view body, std::size_t start) {
+    std::size_t crlf = body.find("\r\n\r\n", start);
+    std::size_t lf = body.find("\n\n", start);
+    if (crlf == std::string_view::npos && lf == std::string_view::npos) {
+        return { std::string_view::npos, 0 };
+    }
+    if (crlf != std::string_view::npos && (lf == std::string_view::npos || crlf <= lf)) {
+        return { crlf, 4 };
+    }
+    return { lf, 2 };
+}
+
+std::pair<std::size_t, std::size_t> FindNextMultipartBoundary(
+    std::string_view body,
+    std::size_t start,
+    std::string_view delimiter) {
+    std::size_t search = start;
+    while (search < body.size()) {
+        std::size_t crlf = body.find("\r\n", search);
+        std::size_t lf = body.find('\n', search);
+        std::size_t lineBreak = std::string_view::npos;
+        std::size_t lineBreakLength = 0;
+        if (crlf != std::string_view::npos && (lf == std::string_view::npos || crlf <= lf)) {
+            lineBreak = crlf;
+            lineBreakLength = 2;
+        } else if (lf != std::string_view::npos) {
+            lineBreak = lf;
+            lineBreakLength = 1;
+        } else {
+            return { std::string_view::npos, 0 };
+        }
+
+        std::size_t candidate = lineBreak + lineBreakLength;
+        if (StartsWithAt(body, candidate, delimiter)) {
+            return { lineBreak, candidate };
+        }
+        search = candidate;
+    }
+    return { std::string_view::npos, 0 };
+}
+
+HeaderCollection ParseMultipartPartHeaders(std::string_view headersText, const FormOptions& options) {
+    if (options.MultipartHeadersLengthLimit != 0 && headersText.size() > options.MultipartHeadersLengthLimit) {
+        throw ParameterBindingException("multipart/form-data part headers exceed FormOptions::MultipartHeadersLengthLimit.");
+    }
+    HeaderCollection headers;
+    std::size_t headerCount = 0;
+    std::size_t position = 0;
+    while (position <= headersText.size()) {
+        std::size_t lineEnd = headersText.find('\n', position);
+        if (lineEnd == std::string_view::npos) {
+            lineEnd = headersText.size();
+        }
+        std::string line(headersText.substr(position, lineEnd - position));
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        line = Trim(std::move(line));
+        if (!line.empty()) {
+            if (options.MultipartHeadersCountLimit != 0 && ++headerCount > options.MultipartHeadersCountLimit) {
+                throw ParameterBindingException("multipart/form-data part header count exceeds FormOptions::MultipartHeadersCountLimit.");
+            }
+            std::size_t colon = line.find(':');
+            if (colon == std::string::npos) {
+                throw ParameterBindingException("multipart/form-data part contains an invalid header line.");
+            }
+            std::string name = Trim(line.substr(0, colon));
+            std::string value = Trim(line.substr(colon + 1));
+            if (!IsValidHeaderName(name)) {
+                throw ParameterBindingException("multipart/form-data part contains an invalid header name.");
+            }
+            headers.Add(std::move(name), std::move(value));
+        }
+        if (lineEnd == headersText.size()) {
+            break;
+        }
+        position = lineEnd + 1;
+    }
+    return headers;
+}
+
+MultipartFormData ParseMultipartFormData(std::string_view contentType, std::string_view body, const FormOptions& options) {
+    MultipartFormData result;
+    std::string boundary = MultipartBoundaryFromContentType(contentType, options);
+    std::string delimiter = "--" + boundary;
+    std::size_t fieldCount = 0;
+    std::size_t fileCount = 0;
+
+    std::size_t position = body.find(delimiter);
+    if (position == std::string_view::npos) {
+        throw ParameterBindingException("multipart/form-data body does not contain the boundary.");
+    }
+
+    while (position < body.size()) {
+        if (!StartsWithAt(body, position, delimiter)) {
+            throw ParameterBindingException("multipart/form-data body has an invalid boundary.");
+        }
+        position += delimiter.size();
+        if (StartsWithAt(body, position, "--")) {
+            return result;
+        }
+
+        position = ConsumeLineBreak(body, position);
+        if (position == std::string_view::npos) {
+            throw ParameterBindingException("multipart/form-data boundary line is invalid.");
+        }
+
+        auto [headersEnd, headerSeparatorLength] = FindMultipartHeaderEnd(body, position);
+        if (headersEnd == std::string_view::npos) {
+            throw ParameterBindingException("multipart/form-data part headers are incomplete.");
+        }
+        HeaderCollection headers = ParseMultipartPartHeaders(body.substr(position, headersEnd - position), options);
+        std::size_t contentStart = headersEnd + headerSeparatorLength;
+
+        auto [contentEnd, nextBoundary] = FindNextMultipartBoundary(body, contentStart, delimiter);
+        if (contentEnd == std::string_view::npos) {
+            throw ParameterBindingException("multipart/form-data part is missing a closing boundary.");
+        }
+
+        std::string disposition = headers.Get("Content-Disposition");
+        if (!EqualsIgnoreCase(HeaderMainValue(disposition), "form-data")) {
+            throw ParameterBindingException("multipart/form-data part must use Content-Disposition: form-data.");
+        }
+        auto name = HeaderParameter(disposition, "name");
+        if (!name || name->empty()) {
+            throw ParameterBindingException("multipart/form-data part is missing the form field name.");
+        }
+        EnsureFormKeyLength(*name, options);
+        std::string partBody(body.substr(contentStart, contentEnd - contentStart));
+        auto fileName = HeaderParameter(disposition, "filename");
+        if (fileName) {
+            if (options.MultipartBodyLengthLimit != 0 &&
+                static_cast<std::uint64_t>(partBody.size()) > options.MultipartBodyLengthLimit) {
+                throw ParameterBindingException("multipart/form-data file body exceeds FormOptions::MultipartBodyLengthLimit.");
+            }
+            if (options.MultipartFileCountLimit != 0 && ++fileCount > options.MultipartFileCountLimit) {
+                throw ParameterBindingException("multipart/form-data file count exceeds FormOptions::MultipartFileCountLimit.");
+            }
+            MultipartFile file;
+            file.Name = std::move(*name);
+            file.FileName = std::move(*fileName);
+            file.ContentType = headers.Get("Content-Type");
+            file.Headers = std::move(headers);
+            file.Body = std::move(partBody);
+            result.Files.push_back(std::move(file));
+        } else {
+            EnsureFormValueCount(++fieldCount, options);
+            EnsureFormValueLength(partBody, options);
+            std::string fieldName = std::move(*name);
+            result.FieldValues[fieldName].push_back(partBody);
+            result.Fields[std::move(fieldName)] = std::move(partBody);
+        }
+
+        position = nextBoundary;
+    }
+
+    throw ParameterBindingException("multipart/form-data body is missing the final boundary.");
 }
 
 std::string NormalizeUrlPrefix(std::string prefix) {
@@ -562,14 +1261,49 @@ std::string StatusReason(int statusCode) {
     case 403: return "Forbidden";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
+    case 406: return "Not Acceptable";
     case 409: return "Conflict";
     case 413: return "Payload Too Large";
+    case 414: return "URI Too Long";
     case 415: return "Unsupported Media Type";
     case 416: return "Range Not Satisfiable";
     case 429: return "Too Many Requests";
+    case 431: return "Request Header Fields Too Large";
     case 500: return "Internal Server Error";
     case 503: return "Service Unavailable";
     default: return "Status";
+    }
+}
+
+bool IsValidHttpStatusCode(int statusCode) {
+    return statusCode >= 100 && statusCode <= 599;
+}
+
+void ValidateHttpStatusCode(int statusCode, std::string_view optionName) {
+    if (!IsValidHttpStatusCode(statusCode)) {
+        throw std::out_of_range(std::string(optionName) + " must be between 100 and 599.");
+    }
+}
+
+bool StatusCodeForbidsResponseBody(int statusCode) {
+    return (statusCode >= 100 && statusCode < 200) ||
+        statusCode == 204 ||
+        statusCode == 304;
+}
+
+bool ShouldSuppressResponseBody(std::string_view method, int statusCode) {
+    return EqualsIgnoreCase(method, "HEAD") ||
+        StatusCodeForbidsResponseBody(statusCode);
+}
+
+void FinalizeInMemoryResponse(const HttpRequest& request, HttpResponse& response) {
+    if (StatusCodeForbidsResponseBody(response.StatusCode())) {
+        response.Headers().Remove("Content-Length");
+    } else if (!response.Headers().Contains("Content-Length")) {
+        response.Header("Content-Length", std::to_string(response.Body().size()));
+    }
+    if (ShouldSuppressResponseBody(request.Method(), response.StatusCode())) {
+        response.ClearBody();
     }
 }
 
@@ -642,6 +1376,90 @@ void EnrichProblemDetails(HttpContext& context, ProblemDetails& problem, const P
     }
 }
 
+void ValidateProblemDetailsOptions(const ProblemDetailsOptions& options) {
+    if (!options.DefaultType.empty()) {
+        ValidateHeaderValue(options.DefaultType, "ProblemDetailsOptions::DefaultType");
+    }
+    if (options.IncludeTraceIdentifier) {
+        std::string extensionName = Trim(options.TraceIdentifierExtensionName);
+        if (extensionName.empty()) {
+            throw std::invalid_argument("ProblemDetailsOptions::TraceIdentifierExtensionName cannot be empty when IncludeTraceIdentifier is true.");
+        }
+        ValidateHeaderValue(extensionName, "ProblemDetailsOptions::TraceIdentifierExtensionName");
+        if (IsReservedProblemProperty(extensionName)) {
+            throw std::invalid_argument("ProblemDetailsOptions::TraceIdentifierExtensionName cannot use a reserved problem-details property name.");
+        }
+    }
+}
+
+class RequestRejectedException : public std::runtime_error {
+public:
+    RequestRejectedException(int statusCode, std::string title, std::string detail)
+        : std::runtime_error(std::move(detail)),
+          statusCode_(statusCode),
+          title_(std::move(title)) {
+    }
+
+    int StatusCode() const noexcept {
+        return statusCode_;
+    }
+
+    const std::string& Title() const noexcept {
+        return title_;
+    }
+
+private:
+    int statusCode_;
+    std::string title_;
+};
+
+std::uint64_t RequestUrlBytes(const HttpRequest& request) {
+    if (!request.RawUrl().empty()) {
+        return static_cast<std::uint64_t>(request.RawUrl().size());
+    }
+
+    std::uint64_t total = request.Path().empty()
+        ? std::uint64_t{ 1 }
+        : static_cast<std::uint64_t>(request.Path().size());
+    if (!request.QueryString().empty()) {
+        total += static_cast<std::uint64_t>(request.QueryString().size());
+    }
+    return total;
+}
+
+std::uint64_t RequestHeaderBytes(const HeaderCollection& headers) {
+    std::uint64_t total = 0;
+    for (const auto& header : headers.Items()) {
+        total += static_cast<std::uint64_t>(header.first.size());
+        total += static_cast<std::uint64_t>(header.second.size());
+        total += 4; // ": " + CRLF framing bytes.
+    }
+    return total;
+}
+
+void EnsureRequestUrlSizeLimit(std::uint64_t urlBytes, const HttpSysOptions& options) {
+    if (options.MaxRequestUrlBytes != 0 && urlBytes > options.MaxRequestUrlBytes) {
+        throw RequestRejectedException(
+            414,
+            "URI Too Long",
+            "Request URL exceeds HttpSysOptions::MaxRequestUrlBytes.");
+    }
+}
+
+void EnsureRequestHeaderSizeLimit(const HeaderCollection& headers, const HttpSysOptions& options) {
+    if (options.MaxRequestHeaderBytes != 0 && RequestHeaderBytes(headers) > options.MaxRequestHeaderBytes) {
+        throw RequestRejectedException(
+            431,
+            "Request Header Fields Too Large",
+            "Request headers exceed HttpSysOptions::MaxRequestHeaderBytes.");
+    }
+}
+
+void EnsureRequestSizeLimits(const HttpRequest& request, const HttpSysOptions& options) {
+    EnsureRequestUrlSizeLimit(RequestUrlBytes(request), options);
+    EnsureRequestHeaderSizeLimit(request.Headers(), options);
+}
+
 void CustomizeProblemDetails(
     HttpContext& context,
     ProblemDetails& problem,
@@ -700,6 +1518,7 @@ ProblemDetails CreateProblemDetails(
     std::string detail,
     int statusCode,
     const ProblemDetailsOptions& options) {
+    ValidateHttpStatusCode(statusCode, "ProblemDetails::Status");
     ProblemDetails problem;
     problem.Type = DefaultProblemType(options);
     problem.Title = std::move(title);
@@ -753,6 +1572,48 @@ HttpResult CreateErrorResult(
         statusCode,
         options,
         logger);
+}
+
+template <typename Handler>
+HttpResult ExecuteWithErrorHandling(
+    HttpContext& context,
+    Handler&& handler,
+    bool detailedErrors,
+    const ProblemDetailsOptions& problemDetailsOptions,
+    const Logger* logger = nullptr) {
+    try {
+        return handler(context);
+    } catch (const RequestRejectedException& ex) {
+        if (logger != nullptr) {
+            Log(*logger, LogLevel::Warning, ex.what());
+        }
+        return CreateProblemResult(context, ex.Title(), ex.what(), ex.StatusCode(), problemDetailsOptions, logger);
+    } catch (const std::length_error& ex) {
+        if (logger != nullptr) {
+            Log(*logger, LogLevel::Warning, ex.what());
+        }
+        return CreateErrorResult(context, "Payload Too Large", ex, 413, detailedErrors, problemDetailsOptions, logger);
+    } catch (const ParameterBindingException& ex) {
+        if (logger != nullptr) {
+            Log(*logger, LogLevel::Warning, ex.what());
+        }
+        return CreateProblemResult(context, "Bad Request", ex.what(), 400, problemDetailsOptions, logger);
+    } catch (const System::Text::Json::JsonException& ex) {
+        if (logger != nullptr) {
+            Log(*logger, LogLevel::Warning, ex.what());
+        }
+        return CreateErrorResult(context, "Invalid JSON", ex, 400, detailedErrors, problemDetailsOptions, logger);
+    } catch (const std::exception& ex) {
+        if (logger != nullptr) {
+            Log(*logger, LogLevel::Error, ex.what());
+        }
+        return CreateErrorResult(context, "Internal Server Error", ex, 500, detailedErrors, problemDetailsOptions, logger);
+    } catch (...) {
+        if (logger != nullptr) {
+            Log(*logger, LogLevel::Error, "Unknown exception.");
+        }
+        return CreateErrorResult(context, "Internal Server Error", "Unknown exception.", 500, detailedErrors, problemDetailsOptions, logger);
+    }
 }
 
 std::optional<ProblemDetails> TryReadProblemDetails(const HttpResult& result, const ProblemDetailsOptions& options) {
@@ -850,18 +1711,66 @@ HealthStatus CombineHealthStatus(HealthStatus current, HealthStatus next) noexce
     return HealthStatus::Healthy;
 }
 
-HttpResult CreateHealthCheckResult(const std::vector<std::pair<std::string, HealthCheck>>& checks, const HealthCheckOptions& options) {
+std::vector<std::string> NormalizeHealthCheckTags(std::vector<std::string> tags) {
+    std::vector<std::string> result;
+    for (std::size_t index = 0; index < tags.size(); ++index) {
+        std::string optionName = "Health check tag[" + std::to_string(index) + "]";
+        if (ContainsUnsafeHeaderValueCharacters(tags[index])) {
+            throw std::invalid_argument(optionName + " cannot contain CR/LF or other control characters.");
+        }
+        std::string tag = Trim(std::move(tags[index]));
+        if (tag.empty()) {
+            continue;
+        }
+        auto existing = std::find_if(result.begin(), result.end(), [&tag](const std::string& value) {
+            return EqualsIgnoreCase(value, tag);
+        });
+        if (existing == result.end()) {
+            result.push_back(std::move(tag));
+        }
+    }
+    return result;
+}
+
+bool HealthCheckHasTag(const HealthCheckRegistration& registration, const std::string& tag) {
+    return std::any_of(registration.Tags.begin(), registration.Tags.end(), [&tag](const std::string& value) {
+        return EqualsIgnoreCase(value, tag);
+    });
+}
+
+bool ShouldRunHealthCheck(const HealthCheckRegistration& registration, const HealthCheckOptions& options) {
+    if (!options.Tags.empty()) {
+        bool matchedTag = std::any_of(options.Tags.begin(), options.Tags.end(), [&registration](const std::string& tag) {
+            return HealthCheckHasTag(registration, tag);
+        });
+        if (!matchedTag) {
+            return false;
+        }
+    }
+    return !options.Predicate || options.Predicate(registration);
+}
+
+HttpResult CreateHealthCheckResult(
+    const std::vector<HealthCheckRegistration>& checks,
+    const HealthCheckOptions& options,
+    bool isRunning,
+    bool isStopping,
+    std::uint64_t activeRequests) {
     using namespace System::Text::Json;
 
     HealthStatus overall = HealthStatus::Healthy;
     JsonObject details;
     auto started = std::chrono::steady_clock::now();
 
-    for (const auto& [name, check] : checks) {
+    for (const HealthCheckRegistration& registration : checks) {
+        if (!ShouldRunHealthCheck(registration, options)) {
+            continue;
+        }
+
         HealthCheckResult result;
         auto checkStarted = std::chrono::steady_clock::now();
         try {
-            result = check();
+            result = registration.Check();
         } catch (const std::exception& ex) {
             result = HealthCheckResult::Unhealthy(ex.what());
         } catch (...) {
@@ -878,19 +1787,35 @@ HttpResult CreateHealthCheckResult(const std::vector<std::pair<std::string, Heal
             if (!result.Description.empty()) {
                 item.Add("description", JsonNode::Create(result.Description));
             }
-            details.Add(name, item);
+            if (!registration.Tags.empty()) {
+                JsonArray tags;
+                for (const std::string& tag : registration.Tags) {
+                    tags.Add(JsonNode::Create(tag));
+                }
+                item.Add("tags", tags);
+            }
+            details.Add(registration.Name, item);
         }
     }
 
     auto totalElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
+    if (isStopping && options.TreatStoppingAsFailure) {
+        overall = CombineHealthStatus(overall, HealthStatus::Unhealthy);
+    }
+
     int statusCode = (overall == HealthStatus::Unhealthy ||
         (overall == HealthStatus::Degraded && options.TreatDegradedAsFailure))
-        ? 503
+        ? options.FailureStatusCode
         : 200;
 
     JsonObject payload;
     payload.Add("status", JsonNode::Create(HealthStatusName(overall)));
     payload.Add("durationMs", JsonNode::Create(static_cast<long long>(totalElapsed.count())));
+    if (options.IncludeApplicationState) {
+        payload.Add("isRunning", JsonNode::Create(isRunning));
+        payload.Add("isStopping", JsonNode::Create(isStopping));
+        payload.Add("activeRequests", JsonNode::Create(static_cast<long long>(activeRequests)));
+    }
     if (options.IncludeDetails) {
         payload.Add("checks", details);
     }
@@ -908,9 +1833,13 @@ struct RequestMetricsStore {
     std::atomic<std::uint64_t> Started{ 0 };
     std::atomic<std::uint64_t> Completed{ 0 };
     std::atomic<std::uint64_t> Failed{ 0 };
+    std::atomic<std::uint64_t> ClientErrors{ 0 };
+    std::atomic<std::uint64_t> ServerErrors{ 0 };
     std::atomic<std::uint64_t> Active{ 0 };
     std::atomic<std::uint64_t> TotalDurationMs{ 0 };
     std::atomic<std::uint64_t> MaxDurationMs{ 0 };
+    std::atomic<std::uint64_t> TotalResponseBytes{ 0 };
+    std::atomic<std::uint64_t> MaxResponseBytes{ 0 };
     mutable std::mutex Mutex;
     std::map<std::string, std::uint64_t> ByMethod;
     std::map<int, std::uint64_t> ByStatusCode;
@@ -921,16 +1850,44 @@ struct RequestMetricsStore {
         Active.fetch_add(1);
     }
 
-    void RecordCompleted(const HttpContext& context, int statusCode, std::chrono::milliseconds duration, const MetricsOptions& options) {
+    static std::string PathCounterKey(const HttpContext& context, const MetricsOptions& options) {
+        if (options.UseMatchedEndpointPatternForPathCounters && context.MatchedEndpoint()) {
+            return context.EndpointPattern(context.Request().Path());
+        }
+        return context.Request().Path();
+    }
+
+    static std::uint64_t ResponseBodyBytes(const HttpContext& context, const HttpResult& result, int statusCode) {
+        if (ShouldSuppressResponseBody(context.Request().Method(), statusCode)) {
+            return 0;
+        }
+        if (result.HasResponse()) {
+            return static_cast<std::uint64_t>(result.Body().size());
+        }
+        return static_cast<std::uint64_t>(context.Response().Body().size());
+    }
+
+    void RecordCompleted(
+        const HttpContext& context,
+        int statusCode,
+        std::chrono::milliseconds duration,
+        std::uint64_t responseBytes,
+        const MetricsOptions& options) {
         Completed.fetch_add(1);
         Active.fetch_sub(1);
+        if (statusCode >= 400 && statusCode < 500) {
+            ClientErrors.fetch_add(1);
+        }
         if (statusCode >= 500) {
             Failed.fetch_add(1);
+            ServerErrors.fetch_add(1);
         }
 
         std::uint64_t elapsed = static_cast<std::uint64_t>((std::max)(duration.count(), 0ll));
         TotalDurationMs.fetch_add(elapsed);
         UpdateAtomicMax(MaxDurationMs, elapsed);
+        TotalResponseBytes.fetch_add(responseBytes);
+        UpdateAtomicMax(MaxResponseBytes, responseBytes);
 
         if (options.IncludeMethodCounters || options.IncludeStatusCodeCounters || options.IncludePathCounters) {
             std::lock_guard lock(Mutex);
@@ -941,7 +1898,7 @@ struct RequestMetricsStore {
                 ++ByStatusCode[statusCode];
             }
             if (options.IncludePathCounters) {
-                ++ByPath[context.Request().Path()];
+                ++ByPath[PathCounterKey(context, options)];
             }
         }
     }
@@ -957,11 +1914,17 @@ struct RequestMetricsStore {
         payload.Add("started", JsonNode::Create(static_cast<long long>(Started.load())));
         payload.Add("completed", JsonNode::Create(static_cast<long long>(completed)));
         payload.Add("failed", JsonNode::Create(static_cast<long long>(Failed.load())));
+        payload.Add("clientErrors", JsonNode::Create(static_cast<long long>(ClientErrors.load())));
+        payload.Add("serverErrors", JsonNode::Create(static_cast<long long>(ServerErrors.load())));
         payload.Add("active", JsonNode::Create(static_cast<long long>(Active.load())));
         payload.Add("uptimeSeconds", JsonNode::Create(static_cast<long long>(uptime.count())));
         payload.Add("totalDurationMs", JsonNode::Create(static_cast<long long>(totalDuration)));
         payload.Add("maxDurationMs", JsonNode::Create(static_cast<long long>(MaxDurationMs.load())));
         payload.Add("averageDurationMs", JsonNode::Create(completed == 0 ? 0.0 : static_cast<double>(totalDuration) / static_cast<double>(completed)));
+        std::uint64_t totalResponseBytes = TotalResponseBytes.load();
+        payload.Add("totalResponseBytes", JsonNode::Create(static_cast<long long>(totalResponseBytes)));
+        payload.Add("maxResponseBytes", JsonNode::Create(static_cast<long long>(MaxResponseBytes.load())));
+        payload.Add("averageResponseBytes", JsonNode::Create(completed == 0 ? 0.0 : static_cast<double>(totalResponseBytes) / static_cast<double>(completed)));
 
         if (options.IncludeDetails) {
             JsonObject details;
@@ -999,6 +1962,46 @@ struct RateLimitDecision {
     std::uint32_t ResetAfterSeconds = 0;
 };
 
+std::uint32_t ToRateLimitSeconds(std::chrono::seconds value) {
+    if (value.count() <= 0) {
+        return 1;
+    }
+    constexpr auto maxSeconds = static_cast<long long>((std::numeric_limits<std::uint32_t>::max)());
+    if (value.count() > maxSeconds) {
+        return (std::numeric_limits<std::uint32_t>::max)();
+    }
+    return static_cast<std::uint32_t>(value.count());
+}
+
+std::string HexUInt64(std::uint64_t value) {
+    std::ostringstream stream;
+    stream << std::hex << std::setw(16) << std::setfill('0') << value;
+    return stream.str();
+}
+
+std::uint64_t StableHash64(std::string_view value) {
+    std::uint64_t hash = 14695981039346656037ull;
+    for (unsigned char ch : value) {
+        hash ^= ch;
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+std::string BoundRateLimitKey(std::string key, std::size_t maxLength) {
+    if (maxLength == 0 || key.size() <= maxLength) {
+        return key;
+    }
+
+    std::string hash = HexUInt64(StableHash64(key));
+    if (maxLength <= hash.size()) {
+        return hash.substr(0, maxLength);
+    }
+
+    std::size_t prefixLength = maxLength - hash.size() - 1;
+    return key.substr(0, prefixLength) + "~" + hash;
+}
+
 class FixedWindowRateLimiter {
 public:
     RateLimitDecision Check(HttpContext& context, const RateLimitOptions& options) {
@@ -1014,7 +2017,25 @@ public:
         std::lock_guard lock(mutex_);
         CleanupExpired(now, options.Window);
 
-        Entry& entry = entries_[decision.Key];
+        auto entryIt = entries_.find(decision.Key);
+        if (entryIt == entries_.end()) {
+            if (options.MaxTrackedKeys != 0 && entries_.size() >= options.MaxTrackedKeys) {
+                CleanupExpired(now, options.Window, true);
+                entryIt = entries_.find(decision.Key);
+            }
+            if (entryIt == entries_.end()) {
+                if (options.MaxTrackedKeys != 0 && entries_.size() >= options.MaxTrackedKeys) {
+                    decision.Allowed = false;
+                    decision.Remaining = 0;
+                    decision.ResetAfterSeconds = ToRateLimitSeconds(options.Window);
+                    decision.RetryAfterSeconds = decision.ResetAfterSeconds;
+                    return decision;
+                }
+                entryIt = entries_.emplace(decision.Key, Entry{}).first;
+            }
+        }
+
+        Entry& entry = entryIt->second;
         if (entry.WindowStarted.time_since_epoch().count() == 0 ||
             now - entry.WindowStarted >= options.Window) {
             entry.WindowStarted = now;
@@ -1026,7 +2047,7 @@ public:
         if (resetAfter.count() <= 0) {
             resetAfter = std::chrono::seconds(1);
         }
-        decision.ResetAfterSeconds = static_cast<std::uint32_t>(resetAfter.count());
+        decision.ResetAfterSeconds = ToRateLimitSeconds(resetAfter);
 
         if (entry.Count >= options.PermitLimit) {
             decision.Allowed = false;
@@ -1058,11 +2079,11 @@ private:
         if (key.empty()) {
             key = "global";
         }
-        return key;
+        return BoundRateLimitKey(std::move(key), options.MaxKeyLength);
     }
 
-    void CleanupExpired(std::chrono::steady_clock::time_point now, std::chrono::seconds window) {
-        if (now < nextCleanup_) {
+    void CleanupExpired(std::chrono::steady_clock::time_point now, std::chrono::seconds window, bool force = false) {
+        if (!force && now < nextCleanup_) {
             return;
         }
         nextCleanup_ = now + (std::max)(window, std::chrono::seconds(30));
@@ -1113,12 +2134,97 @@ void ValidateRateLimitOptions(const RateLimitOptions& options) {
     if (options.Window.count() < 0) {
         throw std::out_of_range("RateLimitOptions::Window cannot be negative.");
     }
+    if (options.MaxKeyLength != 0 && options.MaxKeyLength < 16) {
+        throw std::out_of_range("RateLimitOptions::MaxKeyLength must be at least 16, or 0 for unlimited keys.");
+    }
+    if (!options.ItemKey.empty()) {
+        ValidateHeaderValue(options.ItemKey, "RateLimitOptions::ItemKey");
+    }
     if (options.AddRateLimitHeaders) {
         ValidateHeaderName(options.RetryAfterHeaderName, "RateLimitOptions::RetryAfterHeaderName");
         ValidateHeaderName(options.LimitHeaderName, "RateLimitOptions::LimitHeaderName");
         ValidateHeaderName(options.RemainingHeaderName, "RateLimitOptions::RemainingHeaderName");
         ValidateHeaderName(options.ResetHeaderName, "RateLimitOptions::ResetHeaderName");
     }
+}
+
+void ValidateRequestLoggingOptions(const RequestLoggingOptions& options) {
+    for (std::size_t index = 0; index < options.RedactedQueryParameters.size(); ++index) {
+        std::string optionName = "RequestLoggingOptions::RedactedQueryParameters[" + std::to_string(index) + "]";
+        std::string name = Trim(options.RedactedQueryParameters[index]);
+        if (name.empty()) {
+            throw std::invalid_argument(optionName + " cannot be empty.");
+        }
+        if (name != options.RedactedQueryParameters[index]) {
+            throw std::invalid_argument(optionName + " cannot contain leading or trailing whitespace.");
+        }
+        ValidateHeaderValue(name, optionName);
+    }
+    ValidateHeaderValue(options.RedactedQueryValue, "RequestLoggingOptions::RedactedQueryValue");
+}
+
+void SetHeaderIfMissing(HeaderCollection& headers, std::string name, std::string value);
+std::string EscapeQuotedHeaderValue(std::string value);
+
+std::string FormatElapsedMilliseconds(double milliseconds, int decimalPlaces) {
+    std::ostringstream stream;
+    stream << std::fixed << std::setprecision(decimalPlaces) << milliseconds;
+    return stream.str();
+}
+
+std::string CreateServerTimingMetric(const ServerTimingOptions& options, std::string duration) {
+    std::string value = Trim(options.MetricName) + ";dur=" + std::move(duration);
+    if (!options.MetricDescription.empty()) {
+        value += ";desc=\"" + EscapeQuotedHeaderValue(options.MetricDescription) + "\"";
+    }
+    return value;
+}
+
+void AddServerTimingHeaders(HeaderCollection& headers, const ServerTimingOptions& options, double elapsedMilliseconds) {
+    if (!options.Enable) {
+        return;
+    }
+
+    std::string duration = FormatElapsedMilliseconds(elapsedMilliseconds, options.DecimalPlaces);
+    if (options.AddServerTimingHeader) {
+        std::vector<std::string> existing = headers.GetValues(options.ServerTimingHeaderName);
+        std::string combined = JoinStrings(existing, ", ");
+        if (!combined.empty()) {
+            combined.append(", ");
+        }
+        combined.append(CreateServerTimingMetric(options, duration));
+        headers.Set(options.ServerTimingHeaderName, std::move(combined));
+    }
+    if (options.AddResponseTimeHeader) {
+        SetHeaderIfMissing(headers, options.ResponseTimeHeaderName, duration + "ms");
+    }
+}
+
+void ValidateServerTimingOptions(const ServerTimingOptions& options) {
+    if (options.DecimalPlaces < 0 || options.DecimalPlaces > 6) {
+        throw std::out_of_range("ServerTimingOptions::DecimalPlaces must be between 0 and 6.");
+    }
+    if (options.AddServerTimingHeader) {
+        ValidateHeaderName(options.ServerTimingHeaderName, "ServerTimingOptions::ServerTimingHeaderName");
+        std::string metricName = Trim(options.MetricName);
+        if (metricName.empty() || !IsValidHeaderName(metricName)) {
+            throw std::invalid_argument("ServerTimingOptions::MetricName must be a non-empty Server-Timing metric token.");
+        }
+        ValidateHeaderValue(options.MetricDescription, "ServerTimingOptions::MetricDescription");
+    }
+    if (options.AddResponseTimeHeader) {
+        ValidateHeaderName(options.ResponseTimeHeaderName, "ServerTimingOptions::ResponseTimeHeaderName");
+    }
+    if (!options.ItemKey.empty()) {
+        ValidateHeaderValue(options.ItemKey, "ServerTimingOptions::ItemKey");
+    }
+}
+
+std::string NormalizeHostedServiceName(std::string name, std::string_view optionName) {
+    if (ContainsUnsafeHeaderValueCharacters(name)) {
+        throw std::invalid_argument(std::string(optionName) + " cannot contain CR/LF or other control characters.");
+    }
+    return Trim(std::move(name));
 }
 
 std::string EscapeQuotedHeaderValue(std::string value) {
@@ -1202,6 +2308,135 @@ std::string FormatHttpDate(std::chrono::system_clock::time_point value) {
     char buffer[64]{};
     std::strftime(buffer, sizeof(buffer), "%a, %d %b %Y %H:%M:%S GMT", &utc);
     return buffer;
+}
+
+bool IsCookieNameChar(unsigned char ch) {
+    if (std::isalnum(ch) != 0) {
+        return true;
+    }
+    switch (ch) {
+    case '!': case '#': case '$': case '%': case '&': case '\'':
+    case '*': case '+': case '-': case '.': case '^': case '_':
+    case '`': case '|': case '~':
+        return true;
+    default:
+        return false;
+    }
+}
+
+void ValidateCookieName(std::string_view name) {
+    if (name.empty()) {
+        throw std::invalid_argument("Cookie name cannot be empty.");
+    }
+    for (unsigned char ch : name) {
+        if (!IsCookieNameChar(ch)) {
+            throw std::invalid_argument("Cookie name contains an invalid character.");
+        }
+    }
+}
+
+void ValidateCookieAttributeValue(std::string_view value, std::string_view optionName) {
+    if (ContainsUnsafeHeaderValueCharacters(value) || value.find(';') != std::string_view::npos) {
+        throw std::invalid_argument(std::string(optionName) + " contains an invalid character.");
+    }
+}
+
+std::string EncodeCookieValue(std::string_view value) {
+    static constexpr char hex[] = "0123456789ABCDEF";
+    std::string result;
+    for (unsigned char ch : value) {
+        bool unreserved = std::isalnum(ch) != 0 || ch == '-' || ch == '_' || ch == '.' || ch == '~';
+        if (unreserved) {
+            result.push_back(static_cast<char>(ch));
+        } else {
+            result.push_back('%');
+            result.push_back(hex[(ch >> 4) & 0x0f]);
+            result.push_back(hex[ch & 0x0f]);
+        }
+    }
+    return result;
+}
+
+const char* SameSiteName(CookieSameSiteMode mode) {
+    switch (mode) {
+    case CookieSameSiteMode::Unspecified: return "";
+    case CookieSameSiteMode::Lax: return "Lax";
+    case CookieSameSiteMode::Strict: return "Strict";
+    case CookieSameSiteMode::None: return "None";
+    default:
+        throw std::invalid_argument("CookieOptions::SameSite must be Unspecified, Lax, Strict, or None.");
+    }
+}
+
+std::string SerializeSetCookieHeader(std::string name, std::string value, const CookieOptions& options) {
+    ValidateCookieName(name);
+    if (!options.Path.empty()) {
+        ValidateCookieAttributeValue(options.Path, "CookieOptions::Path");
+    }
+    if (!options.Domain.empty()) {
+        ValidateCookieAttributeValue(options.Domain, "CookieOptions::Domain");
+    }
+
+    std::string header = std::move(name) + "=" + EncodeCookieValue(value);
+    if (options.Expires) {
+        header += "; Expires=" + FormatHttpDate(*options.Expires);
+    }
+    if (options.MaxAge) {
+        header += "; Max-Age=" + std::to_string((std::max)(std::int64_t{ 0 }, options.MaxAge->count()));
+    }
+    if (!options.Domain.empty()) {
+        header += "; Domain=" + options.Domain;
+    }
+    if (!options.Path.empty()) {
+        header += "; Path=" + options.Path;
+    }
+    if (options.Secure) {
+        header += "; Secure";
+    }
+    if (options.HttpOnly) {
+        header += "; HttpOnly";
+    }
+    const char* sameSite = SameSiteName(options.SameSite);
+    if (sameSite[0] != '\0') {
+        header += "; SameSite=";
+        header += sameSite;
+    }
+    return header;
+}
+
+CookieOptions ExpiredCookieOptions(CookieOptions options) {
+    options.Expires = std::chrono::system_clock::from_time_t(0);
+    options.MaxAge = std::chrono::seconds(0);
+    return options;
+}
+
+ValueMap ParseCookieHeaderValues(const std::vector<std::string>& headerValues) {
+    ValueMap cookies;
+    for (const std::string& header : headerValues) {
+        std::size_t position = 0;
+        while (position <= header.size()) {
+            std::size_t semicolon = header.find(';', position);
+            std::string pair = Trim(header.substr(position, semicolon == std::string::npos ? std::string::npos : semicolon - position));
+            if (!pair.empty()) {
+                std::size_t equals = pair.find('=');
+                if (equals != std::string::npos) {
+                    std::string name = Trim(pair.substr(0, equals));
+                    std::string value = StripQuotes(pair.substr(equals + 1));
+                    bool validName = !name.empty() && std::all_of(name.begin(), name.end(), [](unsigned char ch) {
+                        return IsCookieNameChar(ch);
+                    });
+                    if (validName && cookies.find(name) == cookies.end()) {
+                        cookies.emplace(std::move(name), UrlDecode(value, false));
+                    }
+                }
+            }
+            if (semicolon == std::string::npos) {
+                break;
+            }
+            position = semicolon + 1;
+        }
+    }
+    return cookies;
 }
 
 std::optional<std::chrono::system_clock::time_point> ParseHttpDate(std::string value) {
@@ -1317,6 +2552,22 @@ bool IsNotModified(const StaticFileOptions& options, const HttpRequest& request,
         return since && metadata.LastModified <= *since;
     }
     return false;
+}
+
+bool StaticBodyExceedsLimit(const StaticFileOptions& options, std::uint64_t bodySize) {
+    return options.MaximumFileSizeBytes != 0 && bodySize > options.MaximumFileSizeBytes;
+}
+
+HttpResult CreateStaticMetadataResult(
+    int statusCode,
+    std::string contentType,
+    const StaticFileOptions& options,
+    const StaticFileMetadata& metadata,
+    std::uint64_t contentLength) {
+    HttpResult result = Results::Bytes(std::vector<std::uint8_t>{}, std::move(contentType), statusCode);
+    result.Header("Content-Length", std::to_string(contentLength));
+    AddStaticFileHeaders(result, options, metadata);
+    return result;
 }
 
 bool ShouldUseRange(const StaticFileOptions& options, const HttpRequest& request, const StaticFileMetadata& metadata) {
@@ -1452,7 +2703,180 @@ bool IsSameOrChildPath(const std::filesystem::path& root, const std::filesystem:
     return candidateText.size() >= rootText.size() && candidateText.compare(0, rootText.size(), rootText) == 0;
 }
 
-std::optional<std::filesystem::path> ResolveStaticFilePath(const StaticFileOptions& options, const HttpRequest& request) {
+bool WildcardMatchIgnoreCase(std::string pattern, std::string value) {
+    pattern = ToLowerAscii(std::move(pattern));
+    value = ToLowerAscii(std::move(value));
+
+    std::size_t patternIndex = 0;
+    std::size_t valueIndex = 0;
+    std::size_t starIndex = std::string::npos;
+    std::size_t matchIndex = 0;
+
+    while (valueIndex < value.size()) {
+        if (patternIndex < pattern.size() &&
+            (pattern[patternIndex] == '?' || pattern[patternIndex] == value[valueIndex])) {
+            ++patternIndex;
+            ++valueIndex;
+        } else if (patternIndex < pattern.size() && pattern[patternIndex] == '*') {
+            starIndex = patternIndex++;
+            matchIndex = valueIndex;
+        } else if (starIndex != std::string::npos) {
+            patternIndex = starIndex + 1;
+            valueIndex = ++matchIndex;
+        } else {
+            return false;
+        }
+    }
+
+    while (patternIndex < pattern.size() && pattern[patternIndex] == '*') {
+        ++patternIndex;
+    }
+    return patternIndex == pattern.size();
+}
+
+bool MatchesAnyStaticPattern(const std::vector<std::string>& patterns, std::string_view value) {
+    for (const std::string& pattern : patterns) {
+        if (!pattern.empty() && WildcardMatchIgnoreCase(pattern, std::string(value))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IsDotHiddenStaticSegment(std::string_view segment) {
+    return segment.size() > 1 && segment.front() == '.';
+}
+
+bool IsStaticPathSegmentBlocked(const StaticFileOptions& options, std::string_view segment) {
+    if (!options.ServeHiddenFiles && IsDotHiddenStaticSegment(segment)) {
+        return true;
+    }
+    return MatchesAnyStaticPattern(options.BlockedPathSegments, segment);
+}
+
+bool IsStaticFileNameBlocked(const StaticFileOptions& options, std::string_view fileName) {
+    if (!options.ServeHiddenFiles && IsDotHiddenStaticSegment(fileName)) {
+        return true;
+    }
+    return MatchesAnyStaticPattern(options.BlockedFileNames, fileName);
+}
+
+bool HasHiddenFileAttribute(const std::filesystem::path& path) {
+    DWORD attributes = GetFileAttributesW(path.wstring().c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+        (attributes & FILE_ATTRIBUTE_HIDDEN) == FILE_ATTRIBUTE_HIDDEN;
+}
+
+bool PathContainsHiddenFileAttribute(const std::filesystem::path& root, const std::filesystem::path& candidate) {
+    std::wstring rootText = LowerWide(std::filesystem::weakly_canonical(root).wstring());
+    std::filesystem::path current = std::filesystem::weakly_canonical(candidate);
+    while (!current.empty()) {
+        std::wstring currentText = LowerWide(current.wstring());
+        if (currentText == rootText) {
+            return false;
+        }
+        if (HasHiddenFileAttribute(current)) {
+            return true;
+        }
+        std::filesystem::path parent = current.parent_path();
+        if (parent == current) {
+            return false;
+        }
+        current = std::move(parent);
+    }
+    return false;
+}
+
+std::string PathFileNameUtf8(const std::filesystem::path& path) {
+    return WideToUtf8(path.filename().wstring());
+}
+
+bool IsStaticFileAllowed(const StaticFileOptions& options, const std::filesystem::path& root, const std::filesystem::path& candidate) {
+    if (IsStaticFileNameBlocked(options, PathFileNameUtf8(candidate))) {
+        return false;
+    }
+    if (!options.ServeHiddenFiles && PathContainsHiddenFileAttribute(root, candidate)) {
+        return false;
+    }
+    return true;
+}
+
+void ValidateStaticRelativePath(std::string value, std::string_view optionName) {
+    value = Trim(std::move(value));
+    if (value.empty()) {
+        throw std::invalid_argument(std::string(optionName) + " cannot be empty.");
+    }
+    ValidateHeaderValue(value, optionName);
+    if (value.find(':') != std::string::npos) {
+        throw std::invalid_argument(std::string(optionName) + " cannot contain a drive, stream, or URL scheme separator.");
+    }
+    std::replace(value.begin(), value.end(), '\\', '/');
+    if (!value.empty() && value.front() == '/') {
+        throw std::invalid_argument(std::string(optionName) + " must be relative.");
+    }
+    for (const std::string& segment : SplitPath(value)) {
+        if (segment == "." || segment == "..") {
+            throw std::invalid_argument(std::string(optionName) + " cannot contain '.' or '..' path segments.");
+        }
+    }
+}
+
+void ValidateStaticPatterns(const std::vector<std::string>& patterns, std::string_view optionName) {
+    for (std::size_t index = 0; index < patterns.size(); ++index) {
+        std::string itemName = std::string(optionName) + "[" + std::to_string(index) + "]";
+        std::string pattern = Trim(patterns[index]);
+        if (pattern.empty()) {
+            continue;
+        }
+        ValidateHeaderValue(pattern, itemName);
+        if (pattern.find('/') != std::string::npos || pattern.find('\\') != std::string::npos || pattern.find(':') != std::string::npos) {
+            throw std::invalid_argument(itemName + " must be a file or path-segment pattern, not a path.");
+        }
+    }
+}
+
+void ValidateStaticPathPrefix(std::string value, std::string_view optionName, bool allowEmptyAsRoot) {
+    value = Trim(std::move(value));
+    if (value.empty()) {
+        if (allowEmptyAsRoot) {
+            return;
+        }
+        throw std::invalid_argument(std::string(optionName) + " cannot be empty.");
+    }
+    ValidateHeaderValue(value, optionName);
+    if (value.find('?') != std::string::npos || value.find('#') != std::string::npos) {
+        throw std::invalid_argument(std::string(optionName) + " cannot include a query string or fragment.");
+    }
+    if (value.find("://") != std::string::npos || value.find('\\') != std::string::npos ||
+        (value.size() > 1 && value[0] == '/' && value[1] == '/')) {
+        throw std::invalid_argument(std::string(optionName) + " must be an application-relative path prefix.");
+    }
+}
+
+void ValidateStaticFileOptions(const StaticFileOptions& options) {
+    ValidateStaticPathPrefix(options.RequestPath, "StaticFileOptions::RequestPath", true);
+    ValidateHeaderValue(options.CacheControl, "StaticFileOptions::CacheControl");
+    if (options.ServeUnknownFileTypes) {
+        if (Trim(options.UnknownFileContentType).empty()) {
+            throw std::invalid_argument("StaticFileOptions::UnknownFileContentType cannot be empty when ServeUnknownFileTypes is true.");
+        }
+        ValidateHeaderValue(options.UnknownFileContentType, "StaticFileOptions::UnknownFileContentType");
+    }
+    for (std::size_t index = 0; index < options.DefaultFiles.size(); ++index) {
+        ValidateStaticRelativePath(options.DefaultFiles[index], "StaticFileOptions::DefaultFiles[" + std::to_string(index) + "]");
+    }
+    if (options.EnableSpaFallback) {
+        ValidateStaticRelativePath(options.SpaFallbackFile, "StaticFileOptions::SpaFallbackFile");
+        for (std::size_t index = 0; index < options.SpaFallbackExcludedPrefixes.size(); ++index) {
+            std::string itemName = "StaticFileOptions::SpaFallbackExcludedPrefixes[" + std::to_string(index) + "]";
+            ValidateStaticPathPrefix(options.SpaFallbackExcludedPrefixes[index], itemName, false);
+        }
+    }
+    ValidateStaticPatterns(options.BlockedFileNames, "StaticFileOptions::BlockedFileNames");
+    ValidateStaticPatterns(options.BlockedPathSegments, "StaticFileOptions::BlockedPathSegments");
+}
+
+std::optional<std::filesystem::path> ResolveStaticFilePath(const StaticFileOptions& options, const HttpRequest& request, bool& blocked) {
     std::string method = ToLowerAscii(request.Method());
     if (method != "get" && method != "head") {
         return std::nullopt;
@@ -1480,22 +2904,35 @@ std::optional<std::filesystem::path> ResolveStaticFilePath(const StaticFileOptio
         if (segment.empty() || segment == "." || segment == ".." || segment.find('\\') != std::string::npos) {
             return std::nullopt;
         }
+        if (IsStaticPathSegmentBlocked(options, segment)) {
+            blocked = true;
+            return std::nullopt;
+        }
         relative /= Utf8ToWide(segment);
     }
 
     std::filesystem::path candidate = root / relative;
     if (std::filesystem::is_directory(candidate)) {
+        bool foundBlockedDefault = false;
         for (const std::string& defaultFile : options.DefaultFiles) {
             std::filesystem::path defaultCandidate = candidate / Utf8ToWide(defaultFile);
             if (std::filesystem::is_regular_file(defaultCandidate) && IsSameOrChildPath(root, defaultCandidate)) {
-                return defaultCandidate;
+                if (IsStaticFileAllowed(options, root, defaultCandidate)) {
+                    return defaultCandidate;
+                }
+                foundBlockedDefault = true;
             }
         }
+        blocked = foundBlockedDefault;
         return std::nullopt;
     }
 
     if (std::filesystem::is_regular_file(candidate) && IsSameOrChildPath(root, candidate)) {
-        return candidate;
+        if (IsStaticFileAllowed(options, root, candidate)) {
+            return candidate;
+        }
+        blocked = true;
+        return std::nullopt;
     }
 
     if (options.EnableSpaFallback) {
@@ -1509,7 +2946,11 @@ std::optional<std::filesystem::path> ResolveStaticFilePath(const StaticFileOptio
         bool looksLikePageRoute = relative.extension().empty();
         std::filesystem::path fallback = root / Utf8ToWide(options.SpaFallbackFile);
         if (acceptsHtml && looksLikePageRoute && std::filesystem::is_regular_file(fallback) && IsSameOrChildPath(root, fallback)) {
-            return fallback;
+            if (IsStaticFileAllowed(options, root, fallback)) {
+                return fallback;
+            }
+            blocked = true;
+            return std::nullopt;
         }
     }
 
@@ -1517,8 +2958,12 @@ std::optional<std::filesystem::path> ResolveStaticFilePath(const StaticFileOptio
 }
 
 std::optional<HttpResult> TryServeStaticFile(const StaticFileOptions& options, HttpContext& context) {
-    auto path = ResolveStaticFilePath(options, context.Request());
+    bool blocked = false;
+    auto path = ResolveStaticFilePath(options, context.Request(), blocked);
     if (!path) {
+        if (blocked) {
+            return Results::StatusCode(404);
+        }
         return std::nullopt;
     }
 
@@ -1548,6 +2993,15 @@ std::optional<HttpResult> TryServeStaticFile(const StaticFileOptions& options, H
         }
         if (rangeStatus == RangeParseStatus::Satisfiable) {
             std::uint64_t length = range.End - range.Start + 1;
+            if (EqualsIgnoreCase(context.Request().Method(), "HEAD")) {
+                HttpResult result = CreateStaticMetadataResult(206, contentType, options, metadata, length);
+                result.Header("Content-Range",
+                    "bytes " + std::to_string(range.Start) + "-" + std::to_string(range.End) + "/" + std::to_string(metadata.Size));
+                return result;
+            }
+            if (StaticBodyExceedsLimit(options, length)) {
+                return Results::StatusCode(413);
+            }
             auto bytes = ReadFileBytes(*path, range.Start, length);
             HttpResult result = Results::Bytes(bytes, contentType, 206);
             result.Header("Content-Range",
@@ -1555,6 +3009,14 @@ std::optional<HttpResult> TryServeStaticFile(const StaticFileOptions& options, H
             AddStaticFileHeaders(result, options, metadata);
             return result;
         }
+    }
+
+    if (EqualsIgnoreCase(context.Request().Method(), "HEAD")) {
+        return CreateStaticMetadataResult(200, contentType, options, metadata, metadata.Size);
+    }
+
+    if (StaticBodyExceedsLimit(options, metadata.Size)) {
+        return Results::StatusCode(413);
     }
 
     auto bytes = ReadFileBytes(*path);
@@ -1627,6 +3089,13 @@ bool MediaTypeMatchesPattern(std::string_view mediaType, std::string_view patter
     if (normalizedPattern.empty()) {
         return false;
     }
+    if (normalizedPattern == "*" || normalizedPattern == "*/*") {
+        return true;
+    }
+    if (normalizedPattern.size() > 2 && normalizedPattern.ends_with("/*")) {
+        std::string prefix = normalizedPattern.substr(0, normalizedPattern.size() - 1);
+        return StartsWithIgnoreCase(mediaType, prefix);
+    }
     if (normalizedPattern.back() == '/') {
         return StartsWithIgnoreCase(mediaType, normalizedPattern);
     }
@@ -1655,6 +3124,28 @@ bool IsCompressibleContentType(const ResponseCompressionOptions& options, std::s
         }
     }
     return false;
+}
+
+void ValidateMediaTypePatterns(const std::vector<std::string>& patterns, std::string_view optionName) {
+    for (std::size_t index = 0; index < patterns.size(); ++index) {
+        std::string itemName = std::string(optionName) + "[" + std::to_string(index) + "]";
+        std::string pattern = Trim(patterns[index]);
+        if (pattern.empty()) {
+            throw std::invalid_argument(itemName + " cannot be empty.");
+        }
+        ValidateHeaderValue(pattern, itemName);
+        if (pattern.find(',') != std::string::npos || pattern.find(';') != std::string::npos) {
+            throw std::invalid_argument(itemName + " must be a single media type or prefix pattern.");
+        }
+    }
+}
+
+void ValidateResponseCompressionOptions(const ResponseCompressionOptions& options) {
+    if (options.GzipLevel < -1 || options.GzipLevel > 9) {
+        throw std::out_of_range("ResponseCompressionOptions::GzipLevel must be between -1 and 9.");
+    }
+    ValidateMediaTypePatterns(options.MimeTypes, "ResponseCompressionOptions::MimeTypes");
+    ValidateMediaTypePatterns(options.ExcludedMimeTypes, "ResponseCompressionOptions::ExcludedMimeTypes");
 }
 
 double ParseEncodingQuality(std::string_view parameters) {
@@ -1871,27 +3362,344 @@ void ApplyResponseCompression(const HttpRequest& request, HttpResult& result, co
         });
 }
 
+enum class RequestDecompressionStatus {
+    Success,
+    UnsupportedEncoding,
+    InvalidBody,
+    TooLarge,
+};
+
+struct RequestDecompressionResult {
+    RequestDecompressionStatus Status = RequestDecompressionStatus::Success;
+    std::vector<std::uint8_t> Body;
+    std::string Encoding;
+    bool Applied = false;
+};
+
+RequestDecompressionStatus InflateBody(
+    std::string_view input,
+    int windowBits,
+    std::uint64_t maxBytes,
+    std::vector<std::uint8_t>& output) {
+    z_stream stream{};
+    int init = inflateInit2(&stream, windowBits);
+    if (init != Z_OK) {
+        return RequestDecompressionStatus::InvalidBody;
+    }
+
+    output.clear();
+    std::array<std::uint8_t, 64 * 1024> buffer{};
+    const auto* next = reinterpret_cast<const Bytef*>(input.data());
+    std::size_t remaining = input.size();
+    int result = Z_OK;
+
+    do {
+        uInt chunk = static_cast<uInt>((std::min)(remaining, static_cast<std::size_t>((std::numeric_limits<uInt>::max)())));
+        stream.next_in = const_cast<Bytef*>(next);
+        stream.avail_in = chunk;
+        next += chunk;
+        remaining -= chunk;
+
+        do {
+            stream.next_out = reinterpret_cast<Bytef*>(buffer.data());
+            stream.avail_out = static_cast<uInt>(buffer.size());
+            result = inflate(&stream, Z_NO_FLUSH);
+            if (result != Z_OK && result != Z_STREAM_END) {
+                inflateEnd(&stream);
+                return RequestDecompressionStatus::InvalidBody;
+            }
+
+            std::size_t produced = buffer.size() - stream.avail_out;
+            if (maxBytes != 0 && produced > maxBytes - output.size()) {
+                inflateEnd(&stream);
+                return RequestDecompressionStatus::TooLarge;
+            }
+            output.insert(output.end(), buffer.data(), buffer.data() + produced);
+        } while (stream.avail_out == 0 && result != Z_STREAM_END);
+    } while (remaining != 0 && result != Z_STREAM_END);
+
+    inflateEnd(&stream);
+    return result == Z_STREAM_END ? RequestDecompressionStatus::Success : RequestDecompressionStatus::InvalidBody;
+}
+
+RequestDecompressionStatus DecompressGzipBody(
+    std::string_view input,
+    std::uint64_t maxBytes,
+    std::vector<std::uint8_t>& output) {
+    return InflateBody(input, 15 | 16, maxBytes, output);
+}
+
+RequestDecompressionStatus DecompressDeflateBody(
+    std::string_view input,
+    std::uint64_t maxBytes,
+    std::vector<std::uint8_t>& output) {
+    RequestDecompressionStatus status = InflateBody(input, 15, maxBytes, output);
+    if (status == RequestDecompressionStatus::InvalidBody) {
+        status = InflateBody(input, -15, maxBytes, output);
+    }
+    return status;
+}
+
+std::string BytesToString(const std::vector<std::uint8_t>& bytes) {
+    return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+}
+
+RequestDecompressionResult DecompressRequestBody(
+    const HttpRequest& request,
+    const RequestDecompressionOptions& options,
+    std::uint64_t maxBytes) {
+    RequestDecompressionResult result;
+    std::vector<std::string> encodings = SplitCommaSeparatedHeader(request.Header("Content-Encoding"));
+    if (encodings.empty()) {
+        result.Body = StringToBytes(request.Body());
+        return result;
+    }
+
+    result.Applied = true;
+    result.Body = StringToBytes(request.Body());
+    for (auto it = encodings.rbegin(); it != encodings.rend(); ++it) {
+        std::string encoding = ToLowerAscii(Trim(*it));
+        if (encoding.empty() || encoding == "identity") {
+            continue;
+        }
+
+        std::string currentBody = BytesToString(result.Body);
+        std::vector<std::uint8_t> decoded;
+        RequestDecompressionStatus status = RequestDecompressionStatus::UnsupportedEncoding;
+        if (encoding == "gzip" && options.EnableGzip) {
+            status = DecompressGzipBody(currentBody, maxBytes, decoded);
+        } else if (encoding == "deflate" && options.EnableDeflate) {
+            status = DecompressDeflateBody(currentBody, maxBytes, decoded);
+        }
+
+        if (status != RequestDecompressionStatus::Success) {
+            result.Status = status;
+            result.Encoding = std::move(encoding);
+            return result;
+        }
+        result.Body = std::move(decoded);
+    }
+
+    result.Status = RequestDecompressionStatus::Success;
+    return result;
+}
+
+bool IsResponseCachingMethod(std::string_view method) {
+    return EqualsIgnoreCase(method, "GET") || EqualsIgnoreCase(method, "HEAD");
+}
+
+std::uint64_t Fnv1a64(std::uint64_t hash, std::uint8_t value) noexcept {
+    constexpr std::uint64_t prime = 1099511628211ull;
+    hash ^= value;
+    hash *= prime;
+    return hash;
+}
+
+std::string CreateResponseCachingETag(
+    const std::vector<std::uint8_t>& body,
+    std::string contentType,
+    const ResponseCachingOptions& options) {
+    std::uint64_t hash = 14695981039346656037ull;
+    contentType = ToLowerAscii(Trim(std::move(contentType)));
+    for (unsigned char ch : contentType) {
+        hash = Fnv1a64(hash, ch);
+    }
+    hash = Fnv1a64(hash, 0);
+    for (std::uint8_t value : body) {
+        hash = Fnv1a64(hash, value);
+    }
+
+    std::string tag = "\"" + ToHex(static_cast<std::uint64_t>(body.size())) + "-" + ToHex(hash) + "\"";
+    return options.UseWeakETags ? "W/" + tag : tag;
+}
+
+bool ShouldApplyResponseCaching(
+    const HttpRequest& request,
+    int statusCode,
+    const HeaderCollection& headers,
+    const std::vector<std::uint8_t>& body,
+    const ResponseCachingOptions& options) {
+    if (!options.Enable || !IsResponseCachingMethod(request.Method())) {
+        return false;
+    }
+    if (statusCode != 200) {
+        return false;
+    }
+    if (options.MaximumBodySize != 0 && body.size() > options.MaximumBodySize) {
+        return false;
+    }
+    if (headers.Contains("Content-Encoding") ||
+        headers.Contains("Content-Range") ||
+        headers.Contains("Content-MD5") ||
+        headers.Contains("Digest")) {
+        return false;
+    }
+    if (HeadersContainToken(headers, "Cache-Control", "no-store") ||
+        HeaderValueContainsToken(options.CacheControl, "no-store")) {
+        return false;
+    }
+    if (!options.CacheAuthenticatedResponses && !request.Header("Authorization").empty()) {
+        return false;
+    }
+    if (options.SkipSetCookieResponses && headers.Contains("Set-Cookie")) {
+        return false;
+    }
+    return true;
+}
+
+void ApplyResponseCachingHeaders(HeaderCollection& headers, const ResponseCachingOptions& options) {
+    if (!options.CacheControl.empty() && !headers.Contains("Cache-Control")) {
+        headers.Set("Cache-Control", options.CacheControl);
+    }
+}
+
+void CopyResponseCachingHeader(const HeaderCollection& source, HeaderCollection& target, std::string_view name) {
+    for (const std::string& value : source.GetValues(name)) {
+        target.Add(std::string(name), value);
+    }
+}
+
+void CopyResponseCachingHeaders(const HeaderCollection& source, HeaderCollection& target) {
+    CopyResponseCachingHeader(source, target, "Cache-Control");
+    CopyResponseCachingHeader(source, target, "ETag");
+    CopyResponseCachingHeader(source, target, "Expires");
+    CopyResponseCachingHeader(source, target, "Last-Modified");
+    CopyResponseCachingHeader(source, target, "Vary");
+}
+
+HttpResult CreateNotModifiedResult(const HeaderCollection& source) {
+    HttpResult result = Results::StatusCode(304);
+    CopyResponseCachingHeaders(source, result.Headers());
+    return result;
+}
+
+void MarkNotModified(HttpResponse& response) {
+    response.Status(304);
+    response.ClearBody();
+    response.Headers().Remove("Content-Type");
+    response.Headers().Remove("Content-Length");
+    response.Headers().Remove("Content-Range");
+    response.Headers().Remove("Content-Encoding");
+    response.Headers().Remove("Content-MD5");
+    response.Headers().Remove("Digest");
+}
+
+HttpResult ApplyResponseCaching(const HttpRequest& request, HttpResult result, const ResponseCachingOptions& options) {
+    if (!result.HasResponse() ||
+        !ShouldApplyResponseCaching(request, result.StatusCode(), result.Headers(), result.Body(), options)) {
+        return result;
+    }
+
+    ApplyResponseCachingHeaders(result.Headers(), options);
+
+    std::string etag = result.Headers().Get("ETag");
+    if (etag.empty() && options.AddETagHeader) {
+        etag = CreateResponseCachingETag(result.Body(), result.Headers().Get("Content-Type"), options);
+        result.Header("ETag", etag);
+    }
+
+    std::string ifNoneMatch = request.Header("If-None-Match");
+    if (options.EnableConditionalRequests && !etag.empty() && !ifNoneMatch.empty() &&
+        EntityTagListMatches(ifNoneMatch, etag)) {
+        return CreateNotModifiedResult(result.Headers());
+    }
+    return result;
+}
+
+void ApplyResponseCaching(HttpContext& context, const ResponseCachingOptions& options) {
+    HttpResponse& response = context.Response();
+    if (!ShouldApplyResponseCaching(
+            context.Request(),
+            response.StatusCode(),
+            response.Headers(),
+            response.Body(),
+            options)) {
+        return;
+    }
+
+    ApplyResponseCachingHeaders(response.Headers(), options);
+
+    std::string etag = response.Headers().Get("ETag");
+    if (etag.empty() && options.AddETagHeader) {
+        etag = CreateResponseCachingETag(response.Body(), response.ContentType(), options);
+        response.Header("ETag", etag);
+    }
+
+    std::string ifNoneMatch = context.Request().Header("If-None-Match");
+    if (options.EnableConditionalRequests && !etag.empty() && !ifNoneMatch.empty() &&
+        EntityTagListMatches(ifNoneMatch, etag)) {
+        MarkNotModified(response);
+    }
+}
+
 bool AuthenticationSchemeExists(const AuthenticationOptions& options, std::string_view name) {
     return std::any_of(options.Schemes.begin(), options.Schemes.end(), [&](const AuthenticationScheme& scheme) {
         return EqualsIgnoreCase(scheme.Name, name);
     });
 }
 
+void ValidateAuthenticationName(std::string_view value, std::string_view optionName) {
+    std::string raw(value);
+    std::string trimmed = Trim(raw);
+    if (trimmed.empty()) {
+        throw std::invalid_argument(std::string(optionName) + " cannot be empty.");
+    }
+    if (trimmed != raw) {
+        throw std::invalid_argument(std::string(optionName) + " cannot contain leading or trailing whitespace.");
+    }
+    ValidateHeaderValue(raw, optionName);
+}
+
+void ValidateAuthorizationPolicyFields(const AuthorizationPolicy& policy, std::string_view policyName) {
+    if (!policy.Name.empty()) {
+        ValidateHeaderValue(policy.Name, std::string(policyName) + "::Name");
+    }
+    for (std::size_t index = 0; index < policy.RequiredRoles.size(); ++index) {
+        std::string optionName = std::string(policyName) + "::RequiredRoles[" + std::to_string(index) + "]";
+        std::string role = Trim(policy.RequiredRoles[index]);
+        if (role.empty()) {
+            throw std::invalid_argument(optionName + " cannot be empty.");
+        }
+        ValidateHeaderValue(role, optionName);
+    }
+    for (std::size_t index = 0; index < policy.RequiredClaims.size(); ++index) {
+        const AuthorizationClaimRequirement& claim = policy.RequiredClaims[index];
+        std::string optionName = std::string(policyName) + "::RequiredClaims[" + std::to_string(index) + "]";
+        if (Trim(claim.Type).empty()) {
+            throw std::invalid_argument(optionName + "::Type cannot be empty.");
+        }
+        ValidateHeaderValue(claim.Type, optionName + "::Type");
+        if (!claim.Value.empty()) {
+            ValidateHeaderValue(claim.Value, optionName + "::Value");
+        }
+    }
+}
+
 void ValidateAuthenticationOptions(const AuthenticationOptions& options) {
     if (options.Schemes.empty()) {
         throw std::invalid_argument("AuthenticationOptions must contain at least one scheme.");
     }
+    if (!options.UserItemKey.empty()) {
+        ValidateHeaderValue(options.UserItemKey, "AuthenticationOptions::UserItemKey");
+    }
+    if (!options.FailureItemKey.empty()) {
+        ValidateHeaderValue(options.FailureItemKey, "AuthenticationOptions::FailureItemKey");
+    }
+    if (!options.ChallengeItemKey.empty()) {
+        ValidateHeaderValue(options.ChallengeItemKey, "AuthenticationOptions::ChallengeItemKey");
+    }
 
     for (std::size_t index = 0; index < options.Schemes.size(); ++index) {
         const AuthenticationScheme& scheme = options.Schemes[index];
-        if (Trim(scheme.Name).empty()) {
-            throw std::invalid_argument("Authentication scheme name cannot be empty.");
-        }
+        std::string schemeOptionName = "AuthenticationOptions::Schemes[" + std::to_string(index) + "]::Name";
+        ValidateAuthenticationName(scheme.Name, schemeOptionName);
         if (!scheme.Handler) {
             throw std::invalid_argument("Authentication scheme '" + scheme.Name + "' must provide a handler.");
         }
-        if (!scheme.Challenge.empty() && ContainsUnsafeHeaderValueCharacters(scheme.Challenge)) {
-            throw std::invalid_argument("Authentication scheme '" + scheme.Name + "' challenge cannot contain CR/LF.");
+        if (!scheme.Challenge.empty()) {
+            ValidateHeaderValue(
+                scheme.Challenge,
+                "AuthenticationOptions::Schemes[" + std::to_string(index) + "]::Challenge");
         }
         for (std::size_t other = index + 1; other < options.Schemes.size(); ++other) {
             if (EqualsIgnoreCase(scheme.Name, options.Schemes[other].Name)) {
@@ -1900,8 +3708,11 @@ void ValidateAuthenticationOptions(const AuthenticationOptions& options) {
         }
     }
 
-    if (!options.DefaultScheme.empty() && !AuthenticationSchemeExists(options, options.DefaultScheme)) {
-        throw std::invalid_argument("Default authentication scheme '" + options.DefaultScheme + "' is not registered.");
+    if (!options.DefaultScheme.empty()) {
+        ValidateAuthenticationName(options.DefaultScheme, "AuthenticationOptions::DefaultScheme");
+        if (!AuthenticationSchemeExists(options, options.DefaultScheme)) {
+            throw std::invalid_argument("Default authentication scheme '" + options.DefaultScheme + "' is not registered.");
+        }
     }
 }
 
@@ -1909,17 +3720,24 @@ void ValidateAuthorizationOptions(const AuthorizationOptions& options) {
     if (!options.Challenge.empty() && ContainsUnsafeHeaderValueCharacters(options.Challenge)) {
         throw std::invalid_argument("AuthorizationOptions::Challenge cannot contain CR/LF.");
     }
+    if (!options.UserItemKey.empty()) {
+        ValidateHeaderValue(options.UserItemKey, "AuthorizationOptions::UserItemKey");
+    }
+    if (!options.FailureItemKey.empty()) {
+        ValidateHeaderValue(options.FailureItemKey, "AuthorizationOptions::FailureItemKey");
+    }
+    if (!options.AuthenticationChallengeItemKey.empty()) {
+        ValidateHeaderValue(options.AuthenticationChallengeItemKey, "AuthorizationOptions::AuthenticationChallengeItemKey");
+    }
 
     for (std::size_t index = 0; index < options.Policies.size(); ++index) {
         const AuthorizationPolicy& policy = options.Policies[index];
         if (Trim(policy.Name).empty()) {
             throw std::invalid_argument("Authorization policy name cannot be empty.");
         }
-        for (const AuthorizationClaimRequirement& claim : policy.RequiredClaims) {
-            if (Trim(claim.Type).empty()) {
-                throw std::invalid_argument("Authorization policy '" + policy.Name + "' has an empty claim type.");
-            }
-        }
+        ValidateAuthorizationPolicyFields(
+            policy,
+            "AuthorizationOptions::Policies[" + std::to_string(index) + "]");
         for (std::size_t other = index + 1; other < options.Policies.size(); ++other) {
             if (EqualsIgnoreCase(policy.Name, options.Policies[other].Name)) {
                 throw std::invalid_argument("Duplicate authorization policy: " + policy.Name);
@@ -1927,11 +3745,7 @@ void ValidateAuthorizationOptions(const AuthorizationOptions& options) {
         }
     }
 
-    for (const AuthorizationClaimRequirement& claim : options.DefaultPolicy.RequiredClaims) {
-        if (Trim(claim.Type).empty()) {
-            throw std::invalid_argument("Default authorization policy has an empty claim type.");
-        }
-    }
+    ValidateAuthorizationPolicyFields(options.DefaultPolicy, "AuthorizationOptions::DefaultPolicy");
 }
 
 void StoreStringItem(HttpContext& context, const std::string& key, std::string value) {
@@ -1989,6 +3803,90 @@ bool IsCorsOriginAllowed(const CorsOptions& options, const std::string& origin) 
         ContainsTokenIgnoreCase(options.AllowedOrigins, origin);
 }
 
+std::vector<std::string> SplitHeaderTokens(std::string_view value) {
+    std::vector<std::string> result;
+    std::size_t position = 0;
+    while (position <= value.size()) {
+        std::size_t comma = value.find(',', position);
+        std::string token(value.substr(position, comma == std::string_view::npos ? std::string_view::npos : comma - position));
+        token = Trim(std::move(token));
+        if (!token.empty()) {
+            result.push_back(std::move(token));
+        }
+        if (comma == std::string_view::npos) {
+            break;
+        }
+        position = comma + 1;
+    }
+    return result;
+}
+
+bool IsCorsMethodAllowed(const CorsOptions& options, const std::string& method) {
+    return !method.empty() &&
+        (ContainsTokenIgnoreCase(options.AllowedMethods, "*") ||
+            ContainsTokenIgnoreCase(options.AllowedMethods, method));
+}
+
+bool AreCorsRequestHeadersAllowed(const CorsOptions& options, const std::string& requestedHeaders) {
+    if (requestedHeaders.empty() || ContainsTokenIgnoreCase(options.AllowedHeaders, "*")) {
+        return true;
+    }
+    for (const std::string& header : SplitHeaderTokens(requestedHeaders)) {
+        if (!ContainsTokenIgnoreCase(options.AllowedHeaders, header)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::optional<std::string> ValidateCorsPreflightRequest(const CorsOptions& options, const HttpRequest& request) {
+    if (!IsCorsOriginAllowed(options, request.Header("Origin"))) {
+        return std::string("The CORS origin is not allowed.");
+    }
+    if (!IsCorsMethodAllowed(options, request.Header("Access-Control-Request-Method"))) {
+        return std::string("The CORS request method is not allowed.");
+    }
+    if (!AreCorsRequestHeadersAllowed(options, request.Header("Access-Control-Request-Headers"))) {
+        return std::string("One or more CORS request headers are not allowed.");
+    }
+    return std::nullopt;
+}
+
+void ValidateCorsValues(
+    const std::vector<std::string>& values,
+    std::string_view optionName,
+    bool allowWildcard,
+    bool requireHeaderName) {
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        std::string value = Trim(values[index]);
+        std::string itemName = std::string(optionName) + "[" + std::to_string(index) + "]";
+        if (value.empty()) {
+            throw std::invalid_argument(itemName + " cannot be empty.");
+        }
+        ValidateHeaderValue(value, itemName);
+        if (allowWildcard && value == "*") {
+            continue;
+        }
+        if (requireHeaderName) {
+            ValidateHeaderName(value, itemName);
+        }
+    }
+}
+
+void ValidateCorsOptions(const CorsOptions& options) {
+    if (options.PreflightFailureStatusCode < 400 || options.PreflightFailureStatusCode > 599) {
+        throw std::invalid_argument("CorsOptions::PreflightFailureStatusCode must be between 400 and 599.");
+    }
+    if (options.MaxAgeSeconds < 0) {
+        throw std::out_of_range("CorsOptions::MaxAgeSeconds cannot be negative.");
+    }
+
+    ValidateCorsValues(options.AllowedOrigins, "CorsOptions::AllowedOrigins", true, false);
+    ValidateCorsValues(options.AllowedMethods, "CorsOptions::AllowedMethods", true, true);
+    ValidateCorsValues(options.AllowedHeaders, "CorsOptions::AllowedHeaders", true, true);
+    ValidateCorsValues(options.ExposedHeaders, "CorsOptions::ExposedHeaders", false, true);
+}
+
 std::string ResolveCorsOrigin(const CorsOptions& options, const std::string& origin) {
     if (!IsCorsOriginAllowed(options, origin)) {
         return {};
@@ -2008,7 +3906,7 @@ void ApplyCorsHeaders(HeaderCollection& headers, const CorsOptions& options, con
 
     headers.Set("Access-Control-Allow-Origin", allowedOrigin);
     if (allowedOrigin != "*") {
-        headers.Set("Vary", "Origin");
+        AppendHeaderToken(headers, "Vary", "Origin");
     }
     if (options.AllowCredentials) {
         headers.Set("Access-Control-Allow-Credentials", "true");
@@ -2061,6 +3959,72 @@ void ApplySecurityHeaders(HeaderCollection& headers, const SecurityHeadersOption
     }
 }
 
+void ValidateSecurityHeadersOptions(const SecurityHeadersOptions& options) {
+    if (options.AddFrameOptions) {
+        ValidateHeaderValue(options.FrameOptions, "SecurityHeadersOptions::FrameOptions");
+    }
+    if (options.AddReferrerPolicy) {
+        ValidateHeaderValue(options.ReferrerPolicy, "SecurityHeadersOptions::ReferrerPolicy");
+    }
+    if (options.AddCrossOriginOpenerPolicy) {
+        ValidateHeaderValue(options.CrossOriginOpenerPolicy, "SecurityHeadersOptions::CrossOriginOpenerPolicy");
+    }
+    if (!options.ContentSecurityPolicy.empty()) {
+        ValidateHeaderValue(options.ContentSecurityPolicy, "SecurityHeadersOptions::ContentSecurityPolicy");
+    }
+}
+
+void ValidateHstsOptions(const HstsOptions& options) {
+    if (options.MaxAge.count() < 0) {
+        throw std::out_of_range("HstsOptions::MaxAge cannot be negative.");
+    }
+    (void)BuildHostFilterPatterns(options.ExcludedHosts, "HstsOptions::ExcludedHosts");
+}
+
+void ValidateHttpsRedirectionOptions(const HttpsRedirectionOptions& options) {
+    if (!IsHttpsRedirectStatusCode(options.RedirectStatusCode)) {
+        throw std::invalid_argument("HttpsRedirectionOptions::RedirectStatusCode must be 301, 302, 307, or 308.");
+    }
+    ValidateHeaderValue(options.FailureDetail, "HttpsRedirectionOptions::FailureDetail");
+}
+
+void ValidateHostFilteringOptions(const HostFilteringOptions& options) {
+    if (options.RejectedStatusCode < 400 || options.RejectedStatusCode > 599) {
+        throw std::invalid_argument("HostFilteringOptions::RejectedStatusCode must be between 400 and 599.");
+    }
+    ValidateHeaderValue(options.FailureDetail, "HostFilteringOptions::FailureDetail");
+    ValidateHeaderValue(options.ItemKey, "HostFilteringOptions::ItemKey");
+    (void)BuildHostFilterPatterns(options.AllowedHosts, "HostFilteringOptions::AllowedHosts");
+}
+
+void ValidateForwardedHeadersOptions(const ForwardedHeadersOptions& options) {
+    if (options.ForwardedFor) {
+        ValidateHeaderName(options.ForwardedForHeaderName, "ForwardedHeadersOptions::ForwardedForHeaderName");
+    }
+    if (options.ForwardedProto) {
+        ValidateHeaderName(options.ForwardedProtoHeaderName, "ForwardedHeadersOptions::ForwardedProtoHeaderName");
+    }
+    if (options.ForwardedHost) {
+        ValidateHeaderName(options.ForwardedHostHeaderName, "ForwardedHeadersOptions::ForwardedHostHeaderName");
+    }
+    if (options.ForwardLimit == 0) {
+        throw std::out_of_range("ForwardedHeadersOptions::ForwardLimit must be greater than 0.");
+    }
+    if (!options.AppliedItemKey.empty()) {
+        ValidateHeaderValue(options.AppliedItemKey, "ForwardedHeadersOptions::AppliedItemKey");
+    }
+    for (std::size_t index = 0; index < options.KnownProxies.size(); ++index) {
+        std::string normalized = NormalizeForwardedAddress(options.KnownProxies[index]);
+        if (normalized.empty() ||
+            ContainsUnsafeHeaderValueCharacters(normalized) ||
+            ContainsInvalidHostNameCharacters(normalized)) {
+            throw std::invalid_argument(
+                "ForwardedHeadersOptions::KnownProxies[" + std::to_string(index) +
+                "] must be a valid proxy host or address.");
+        }
+    }
+}
+
 void ApplySecurityHeaders(HttpResult& result, const SecurityHeadersOptions& options) {
     HeaderCollection headers;
     ApplySecurityHeaders(headers, options);
@@ -2072,6 +4036,7 @@ void ApplySecurityHeaders(HttpResult& result, const SecurityHeadersOptions& opti
 struct RouteSegment {
     std::string Literal;
     std::string Name;
+    std::string Constraint;
     bool IsParameter = false;
     bool IsCatchAll = false;
 };
@@ -2085,6 +4050,8 @@ struct RouteEndpoint {
     bool RequireAuthorization = false;
     bool AllowAnonymous = false;
     std::vector<std::string> AuthorizationPolicies;
+    std::vector<AuthorizationPolicy> AuthorizationRequirements;
+    std::size_t GroupAuthorizationRequirementCount = 0;
     bool ExcludeFromDescription = false;
     std::string Name;
     std::vector<std::string> Tags;
@@ -2093,7 +4060,17 @@ struct RouteEndpoint {
     std::vector<OpenApiParameter> OpenApiParameters;
     std::vector<OpenApiResponse> OpenApiResponses;
     std::vector<OpenApiRequestBody> OpenApiRequestBodies;
+    std::vector<EndpointFilter> Filters;
 };
+
+EndpointMatch CreateEndpointMatch(const RouteEndpoint& endpoint) {
+    EndpointMatch match;
+    match.Pattern = endpoint.Pattern;
+    match.Name = endpoint.Name;
+    match.Methods = endpoint.Methods;
+    match.IsFallback = endpoint.IsFallback;
+    return match;
+}
 
 struct HostedServiceRegistration {
     std::string Name;
@@ -2102,42 +4079,236 @@ struct HostedServiceRegistration {
     bool Started = false;
 };
 
+enum class EndpointMethodMatch {
+    None,
+    Exact,
+    ImplicitHead,
+};
+
+bool IsSupportedRouteConstraint(std::string_view constraint) {
+    return constraint.empty() ||
+        EqualsIgnoreCase(constraint, "int") ||
+        EqualsIgnoreCase(constraint, "long") ||
+        EqualsIgnoreCase(constraint, "float") ||
+        EqualsIgnoreCase(constraint, "double") ||
+        EqualsIgnoreCase(constraint, "bool") ||
+        EqualsIgnoreCase(constraint, "guid") ||
+        EqualsIgnoreCase(constraint, "alpha");
+}
+
+bool HasSignedIntegerSyntax(std::string_view value) {
+    if (value.empty()) {
+        return false;
+    }
+    std::size_t index = 0;
+    if (value[index] == '-') {
+        ++index;
+    }
+    if (index == value.size()) {
+        return false;
+    }
+    return std::all_of(value.begin() + static_cast<std::ptrdiff_t>(index), value.end(), [](unsigned char ch) {
+        return std::isdigit(ch) != 0;
+    });
+}
+
+bool IsIntegerInRange(std::string_view value, long long minValue, long long maxValue) {
+    if (!HasSignedIntegerSyntax(value)) {
+        return false;
+    }
+    try {
+        std::size_t consumed = 0;
+        long long parsed = std::stoll(std::string(value), &consumed, 10);
+        return consumed == value.size() && parsed >= minValue && parsed <= maxValue;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool IsFloatingPointValue(std::string_view value) {
+    if (value.empty()) {
+        return false;
+    }
+    std::string text(value);
+    char* end = nullptr;
+    errno = 0;
+    double parsed = std::strtod(text.c_str(), &end);
+    return end == text.c_str() + text.size() &&
+        errno != ERANGE &&
+        std::isfinite(parsed);
+}
+
+bool IsGuidValue(std::string_view value) {
+    if (value.size() == 38 && value.front() == '{' && value.back() == '}') {
+        value.remove_prefix(1);
+        value.remove_suffix(1);
+    }
+    if (value.size() != 36) {
+        return false;
+    }
+    for (std::size_t index = 0; index < value.size(); ++index) {
+        bool hyphen = index == 8 || index == 13 || index == 18 || index == 23;
+        if (hyphen) {
+            if (value[index] != '-') {
+                return false;
+            }
+            continue;
+        }
+        if (HexValue(value[index]) < 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool MatchesRouteConstraint(std::string_view value, std::string_view constraint) {
+    if (constraint.empty()) {
+        return true;
+    }
+    if (EqualsIgnoreCase(constraint, "int")) {
+        return IsIntegerInRange(value, std::numeric_limits<int>::min(), std::numeric_limits<int>::max());
+    }
+    if (EqualsIgnoreCase(constraint, "long")) {
+        return IsIntegerInRange(value, std::numeric_limits<long long>::min(), std::numeric_limits<long long>::max());
+    }
+    if (EqualsIgnoreCase(constraint, "float") || EqualsIgnoreCase(constraint, "double")) {
+        return IsFloatingPointValue(value);
+    }
+    if (EqualsIgnoreCase(constraint, "bool")) {
+        return EqualsIgnoreCase(value, "true") ||
+            EqualsIgnoreCase(value, "false") ||
+            value == "0" ||
+            value == "1";
+    }
+    if (EqualsIgnoreCase(constraint, "guid")) {
+        return IsGuidValue(value);
+    }
+    if (EqualsIgnoreCase(constraint, "alpha")) {
+        return !value.empty() && std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+            return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
+        });
+    }
+    return false;
+}
+
+std::string RouteConstraintSchemaType(std::string_view constraint) {
+    if (EqualsIgnoreCase(constraint, "int") || EqualsIgnoreCase(constraint, "long")) {
+        return "integer";
+    }
+    if (EqualsIgnoreCase(constraint, "float") || EqualsIgnoreCase(constraint, "double")) {
+        return "number";
+    }
+    if (EqualsIgnoreCase(constraint, "bool")) {
+        return "boolean";
+    }
+    return "string";
+}
+
+std::string RouteConstraintSchemaFormat(std::string_view constraint) {
+    if (EqualsIgnoreCase(constraint, "int")) {
+        return "int32";
+    }
+    if (EqualsIgnoreCase(constraint, "long")) {
+        return "int64";
+    }
+    if (EqualsIgnoreCase(constraint, "float")) {
+        return "float";
+    }
+    if (EqualsIgnoreCase(constraint, "double")) {
+        return "double";
+    }
+    if (EqualsIgnoreCase(constraint, "guid")) {
+        return "uuid";
+    }
+    return {};
+}
+
+bool IsValidRouteParameterName(std::string_view name) {
+    if (name.empty()) {
+        return false;
+    }
+    auto isAlphaOrUnderscore = [](unsigned char ch) {
+        return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_';
+    };
+    auto isAlphaDigitOrUnderscore = [&](unsigned char ch) {
+        return isAlphaOrUnderscore(ch) || std::isdigit(ch) != 0;
+    };
+    if (!isAlphaOrUnderscore(static_cast<unsigned char>(name.front()))) {
+        return false;
+    }
+    return std::all_of(name.begin() + 1, name.end(), [&](unsigned char ch) {
+        return isAlphaDigitOrUnderscore(ch);
+    });
+}
+
 std::vector<RouteSegment> CompileRoutePattern(std::string_view pattern) {
     std::vector<RouteSegment> compiled;
-    for (std::string segment : SplitPath(NormalizeRoutePath(std::string(pattern)))) {
-        if (segment.size() >= 2 && segment.front() == '{' && segment.back() == '}') {
-            segment = segment.substr(1, segment.size() - 2);
+    std::vector<std::string> parameterNames;
+    std::vector<std::string> segments = SplitPath(NormalizeRoutePath(std::string(pattern)));
+    for (std::size_t index = 0; index < segments.size(); ++index) {
+        std::string segment = segments[index];
+        bool parameterSegment = segment.size() >= 2 && segment.front() == '{' && segment.back() == '}';
+        if (parameterSegment) {
+            segment = Trim(segment.substr(1, segment.size() - 2));
             RouteSegment routeSegment;
             routeSegment.IsParameter = true;
             if (!segment.empty() && segment.front() == '*') {
                 routeSegment.IsCatchAll = true;
-                segment.erase(segment.begin());
+                segment = Trim(segment.substr(1));
+                if (index + 1 != segments.size()) {
+                    throw std::invalid_argument("Catch-all route parameter '" + segment + "' must be the last segment.");
+                }
             }
             if (segment.empty()) {
                 throw std::invalid_argument("Route parameter name cannot be empty.");
             }
+            std::size_t constraintStart = segment.find(':');
+            if (constraintStart != std::string::npos) {
+                routeSegment.Constraint = ToLowerAscii(Trim(segment.substr(constraintStart + 1)));
+                segment = Trim(segment.substr(0, constraintStart));
+                if (segment.empty()) {
+                    throw std::invalid_argument("Route parameter name cannot be empty.");
+                }
+                if (!IsSupportedRouteConstraint(routeSegment.Constraint)) {
+                    throw std::invalid_argument("Route parameter '" + segment + "' uses unsupported constraint '" + routeSegment.Constraint + "'.");
+                }
+            }
+            if (!IsValidRouteParameterName(segment)) {
+                throw std::invalid_argument("Route parameter '" + segment + "' has an invalid name.");
+            }
+            if (ContainsTokenIgnoreCase(parameterNames, segment)) {
+                throw std::invalid_argument("Route parameter '" + segment + "' is duplicated in the route pattern.");
+            }
+            parameterNames.push_back(segment);
             routeSegment.Name = std::move(segment);
             compiled.push_back(std::move(routeSegment));
         } else {
-            compiled.push_back(RouteSegment{ ToLowerAscii(segment), {}, false, false });
+            if (segment.find('{') != std::string::npos || segment.find('}') != std::string::npos) {
+                throw std::invalid_argument("Route segment '" + segment + "' contains unmatched or unsupported braces.");
+            }
+            compiled.push_back(RouteSegment{ ToLowerAscii(segment), {}, {}, false, false });
         }
     }
     return compiled;
 }
 
-bool EndpointAllowsMethod(const RouteEndpoint& endpoint, std::string_view method) {
+EndpointMethodMatch MatchEndpointMethod(const RouteEndpoint& endpoint, std::string_view method) {
     if (endpoint.Methods.empty()) {
-        return true;
+        return EndpointMethodMatch::Exact;
     }
     for (const std::string& allowed : endpoint.Methods) {
         if (EqualsIgnoreCase(allowed, method)) {
-            return true;
+            return EndpointMethodMatch::Exact;
         }
         if (EqualsIgnoreCase(method, "HEAD") && EqualsIgnoreCase(allowed, "GET")) {
-            return true;
+            return EndpointMethodMatch::ImplicitHead;
         }
     }
-    return false;
+    return EndpointMethodMatch::None;
+}
+
+bool EndpointAllowsMethod(const RouteEndpoint& endpoint, std::string_view method) {
+    return MatchEndpointMethod(endpoint, method) != EndpointMethodMatch::None;
 }
 
 bool MatchEndpointPath(const RouteEndpoint& endpoint, const HttpRequest& request, ValueMap& routeValues) {
@@ -2153,6 +4324,9 @@ bool MatchEndpointPath(const RouteEndpoint& endpoint, const HttpRequest& request
                 }
                 value += UrlDecode(pathSegments[pathIndex], false);
             }
+            if (!MatchesRouteConstraint(value, segment.Constraint)) {
+                return false;
+            }
             routeValues[segment.Name] = std::move(value);
             return true;
         }
@@ -2162,7 +4336,11 @@ bool MatchEndpointPath(const RouteEndpoint& endpoint, const HttpRequest& request
         }
 
         if (segment.IsParameter) {
-            routeValues[segment.Name] = UrlDecode(pathSegments[pathIndex], false);
+            std::string value = UrlDecode(pathSegments[pathIndex], false);
+            if (!MatchesRouteConstraint(value, segment.Constraint)) {
+                return false;
+            }
+            routeValues[segment.Name] = std::move(value);
         } else if (!EqualsIgnoreCase(segment.Literal, pathSegments[pathIndex])) {
             return false;
         }
@@ -2215,7 +4393,146 @@ bool EndpointNeedsAuthorization(const RouteEndpoint& endpoint, const Authorizati
     if (endpoint.AllowAnonymous) {
         return false;
     }
-    return endpoint.RequireAuthorization || options.RequireAuthenticatedUserByDefault;
+    return endpoint.RequireAuthorization ||
+        !endpoint.AuthorizationPolicies.empty() ||
+        !endpoint.AuthorizationRequirements.empty() ||
+        options.RequireAuthenticatedUserByDefault;
+}
+
+std::string JoinRequestBodyContentTypes(const std::vector<OpenApiRequestBody>& requestBodies) {
+    std::vector<std::string> contentTypes;
+    for (const OpenApiRequestBody& body : requestBodies) {
+        if (!Trim(body.ContentType).empty()) {
+            contentTypes.push_back(body.ContentType);
+        }
+    }
+    return JoinStrings(contentTypes, ", ");
+}
+
+std::optional<std::string> ValidateEndpointContentType(const RouteEndpoint& endpoint, const HttpRequest& request) {
+    if (endpoint.OpenApiRequestBodies.empty()) {
+        return std::nullopt;
+    }
+
+    std::string requestContentType = request.Header("Content-Type");
+    std::string requestMediaType = MediaTypeFromContentType(requestContentType);
+    bool hasAcceptedContentTypes = false;
+    bool requiresContentType = false;
+    for (const OpenApiRequestBody& body : endpoint.OpenApiRequestBodies) {
+        std::string acceptedMediaType = MediaTypeFromContentType(body.ContentType);
+        if (acceptedMediaType.empty()) {
+            continue;
+        }
+        hasAcceptedContentTypes = true;
+        requiresContentType = requiresContentType || body.Required;
+        if (!requestMediaType.empty() && MediaTypeMatchesPattern(requestMediaType, acceptedMediaType)) {
+            return std::nullopt;
+        }
+    }
+
+    if (!hasAcceptedContentTypes) {
+        return std::nullopt;
+    }
+
+    std::string expected = JoinRequestBodyContentTypes(endpoint.OpenApiRequestBodies);
+    if (requestMediaType.empty()) {
+        if (!requiresContentType) {
+            return std::nullopt;
+        }
+        return "Request Content-Type is required. Supported content types: " + expected + ".";
+    }
+
+    return "Unsupported request Content-Type '" + requestContentType + "'. Supported content types: " + expected + ".";
+}
+
+std::vector<std::string> SuccessResponseContentTypes(const std::vector<OpenApiResponse>& responses) {
+    std::vector<std::string> contentTypes;
+    for (const OpenApiResponse& response : responses) {
+        if (response.StatusCode < 200 || response.StatusCode >= 400 ||
+            response.StatusCode == 204 || response.StatusCode == 304) {
+            continue;
+        }
+
+        std::string mediaType = MediaTypeFromContentType(response.ContentType);
+        if (!mediaType.empty() && !ContainsTokenIgnoreCase(contentTypes, mediaType)) {
+            contentTypes.push_back(std::move(mediaType));
+        }
+    }
+    return contentTypes;
+}
+
+int AcceptMediaRangeSpecificity(std::string_view mediaRange) {
+    std::string normalized = ToLowerAscii(Trim(std::string(mediaRange)));
+    if (normalized == "*" || normalized == "*/*") {
+        return 0;
+    }
+    if (normalized.size() > 2 && normalized.ends_with("/*")) {
+        return 1;
+    }
+    return 2;
+}
+
+double ParseAcceptQuality(std::string_view value) {
+    std::size_t semicolon = value.find(';');
+    if (semicolon == std::string_view::npos) {
+        return 1.0;
+    }
+    return ParseEncodingQuality(value.substr(semicolon + 1));
+}
+
+double AcceptedQualityForMediaType(std::string_view mediaType, std::string_view acceptHeader) {
+    int bestSpecificity = -1;
+    double bestQuality = 0.0;
+    std::size_t position = 0;
+    while (position <= acceptHeader.size()) {
+        std::size_t comma = acceptHeader.find(',', position);
+        std::string item(acceptHeader.substr(position, comma == std::string_view::npos ? std::string_view::npos : comma - position));
+        item = Trim(std::move(item));
+        if (!item.empty()) {
+            std::string mediaRange = MediaTypeFromContentType(item);
+            if (!mediaRange.empty() && MediaTypeMatchesPattern(mediaType, mediaRange)) {
+                int specificity = AcceptMediaRangeSpecificity(mediaRange);
+                double quality = ParseAcceptQuality(item);
+                if (specificity > bestSpecificity) {
+                    bestSpecificity = specificity;
+                    bestQuality = quality;
+                } else if (specificity == bestSpecificity) {
+                    bestQuality = std::max(bestQuality, quality);
+                }
+            }
+        }
+
+        if (comma == std::string_view::npos) {
+            break;
+        }
+        position = comma + 1;
+    }
+    return bestQuality;
+}
+
+std::optional<std::string> ValidateEndpointAccept(const RouteEndpoint& endpoint, const HttpRequest& request) {
+    if (endpoint.OpenApiResponses.empty()) {
+        return std::nullopt;
+    }
+
+    std::vector<std::string> contentTypes = SuccessResponseContentTypes(endpoint.OpenApiResponses);
+    if (contentTypes.empty()) {
+        return std::nullopt;
+    }
+
+    std::string accept = request.Header("Accept");
+    if (Trim(accept).empty()) {
+        return std::nullopt;
+    }
+
+    for (const std::string& contentType : contentTypes) {
+        if (AcceptedQualityForMediaType(contentType, accept) > 0.0) {
+            return std::nullopt;
+        }
+    }
+
+    return "The requested Accept header is not supported. Supported response content types: " +
+        JoinStrings(contentTypes, ", ") + ".";
 }
 
 std::optional<std::string> EvaluateAuthorizationPolicy(
@@ -2265,7 +4582,7 @@ std::optional<HttpResult> TryAuthorizeEndpoint(
 
     const ClaimsPrincipal& user = context.User();
     std::vector<AuthorizationPolicy> policies;
-    if (endpoint.AuthorizationPolicies.empty()) {
+    if (endpoint.AuthorizationPolicies.empty() && endpoint.AuthorizationRequirements.empty()) {
         policies.push_back(options.DefaultPolicy);
     } else {
         for (const std::string& policyName : endpoint.AuthorizationPolicies) {
@@ -2274,6 +4591,9 @@ std::optional<HttpResult> TryAuthorizeEndpoint(
                 return Results::Problem("Authorization Policy Not Found", "Policy '" + policyName + "' is not registered.", 500);
             }
             policies.push_back(*policy);
+        }
+        for (const AuthorizationPolicy& policy : endpoint.AuthorizationRequirements) {
+            policies.push_back(policy);
         }
     }
 
@@ -2301,13 +4621,318 @@ std::optional<HttpResult> TryAuthorizeEndpoint(
     return std::nullopt;
 }
 
+AuthorizationPolicy& EnsureEndpointAuthorizationRequirement(RouteEndpoint& endpoint) {
+    endpoint.RequireAuthorization = true;
+    endpoint.AllowAnonymous = false;
+    if (endpoint.AuthorizationRequirements.size() == endpoint.GroupAuthorizationRequirementCount) {
+        endpoint.AuthorizationRequirements.emplace_back();
+    }
+    return endpoint.AuthorizationRequirements.back();
+}
+
+bool IsValidMediaTypePart(std::string_view value, bool allowWildcard) {
+    if (value.empty()) {
+        return false;
+    }
+    if (allowWildcard && value == "*") {
+        return true;
+    }
+    return std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+        return std::isalnum(ch) != 0 ||
+            ch == '!' || ch == '#' || ch == '$' || ch == '&' ||
+            ch == '-' || ch == '^' || ch == '_' || ch == '.' || ch == '+';
+    });
+}
+
+void ValidateMediaTypeValue(std::string_view contentType, std::string_view optionName, bool allowWildcard) {
+    std::string raw = Trim(std::string(contentType));
+    if (raw.empty()) {
+        throw std::invalid_argument(std::string(optionName) + " cannot be empty.");
+    }
+    ValidateHeaderValue(raw, optionName);
+    if (raw.find(',') != std::string::npos) {
+        throw std::invalid_argument(std::string(optionName) + " must be a single media type.");
+    }
+
+    std::string mediaType = MediaTypeFromContentType(raw);
+    std::size_t slash = mediaType.find('/');
+    if (slash == std::string::npos || slash == 0 || slash + 1 == mediaType.size()) {
+        throw std::invalid_argument(std::string(optionName) + " must be a valid media type.");
+    }
+
+    std::string_view type(mediaType.data(), slash);
+    std::string_view subtype(mediaType.data() + slash + 1, mediaType.size() - slash - 1);
+    if (!IsValidMediaTypePart(type, allowWildcard) || !IsValidMediaTypePart(subtype, allowWildcard) ||
+        (type == "*" && subtype != "*")) {
+        throw std::invalid_argument(std::string(optionName) + " must be a valid media type.");
+    }
+}
+
+std::string NormalizeFrameworkEndpointPath(std::string path, std::string_view optionName, std::string_view defaultPath) {
+    path = Trim(std::move(path));
+    if (path.empty()) {
+        path = std::string(defaultPath);
+    }
+    ValidateHeaderValue(path, optionName);
+    if (path.find('?') != std::string::npos || path.find('#') != std::string::npos) {
+        throw std::invalid_argument(std::string(optionName) + " cannot include a query string or fragment.");
+    }
+    if (path.find("://") != std::string::npos || path.find('\\') != std::string::npos ||
+        (path.size() > 1 && path[0] == '/' && path[1] == '/')) {
+        throw std::invalid_argument(std::string(optionName) + " must be an application-relative route path.");
+    }
+    return NormalizeRoutePath(std::move(path));
+}
+
+void ValidateHealthCheckOptions(const HealthCheckOptions& options) {
+    if (options.FailureStatusCode < 400 || options.FailureStatusCode > 599) {
+        throw std::invalid_argument("HealthCheckOptions::FailureStatusCode must be between 400 and 599.");
+    }
+}
+
+std::string NormalizeEndpointRoutePattern(std::string pattern, std::string_view optionName) {
+    pattern = Trim(std::move(pattern));
+    ValidateHeaderValue(pattern, optionName);
+    if (pattern.find('?') != std::string::npos || pattern.find('#') != std::string::npos) {
+        throw std::invalid_argument(std::string(optionName) + " cannot include a query string or fragment.");
+    }
+    if (pattern.find("://") != std::string::npos || pattern.find('\\') != std::string::npos ||
+        (pattern.size() > 1 && pattern[0] == '/' && pattern[1] == '/')) {
+        throw std::invalid_argument(std::string(optionName) + " must be an application-relative route path.");
+    }
+    return NormalizeRoutePath(std::move(pattern));
+}
+
+std::string NormalizeEndpointMethod(std::string method, std::string_view optionName) {
+    method = ToUpperAscii(Trim(std::move(method)));
+    if (!IsValidHeaderName(method)) {
+        throw std::invalid_argument(std::string(optionName) + " must be a non-empty HTTP method token.");
+    }
+    return method;
+}
+
+bool EndpointMethodSetsOverlap(const std::vector<std::string>& left, const std::vector<std::string>& right) {
+    if (left.empty() || right.empty()) {
+        return true;
+    }
+    return std::any_of(left.begin(), left.end(), [&right](const std::string& method) {
+        return ContainsTokenIgnoreCase(right, method);
+    });
+}
+
+std::string DescribeEndpointMethods(const std::vector<std::string>& methods) {
+    return methods.empty() ? std::string("*") : JoinStrings(methods, ", ");
+}
+
+bool EndpointRouteConflicts(const RouteEndpoint& existing, const RouteEndpoint& candidate) {
+    return EqualsIgnoreCase(existing.Pattern, candidate.Pattern) &&
+        EndpointMethodSetsOverlap(existing.Methods, candidate.Methods);
+}
+
+const std::string* FindRouteValue(const ValueMap& values, std::string_view name) {
+    auto exact = values.find(std::string(name));
+    if (exact != values.end()) {
+        return &exact->second;
+    }
+    for (const auto& [key, value] : values) {
+        if (EqualsIgnoreCase(key, name)) {
+            return &value;
+        }
+    }
+    return nullptr;
+}
+
+std::optional<std::string> TryBuildPathFromEndpoint(
+    const RouteEndpoint& endpoint,
+    const ValueMap& routeValues,
+    const ValueMap& queryValues,
+    std::string* error) {
+    std::string path;
+    std::vector<std::string> segments = SplitPath(endpoint.Pattern);
+    for (const std::string& rawSegment : segments) {
+        std::string segment = rawSegment;
+        bool parameterSegment = segment.size() >= 2 && segment.front() == '{' && segment.back() == '}';
+        path.push_back('/');
+        if (!parameterSegment) {
+            path += segment;
+            continue;
+        }
+
+        segment = Trim(segment.substr(1, segment.size() - 2));
+        bool catchAll = false;
+        if (!segment.empty() && segment.front() == '*') {
+            catchAll = true;
+            segment = Trim(segment.substr(1));
+        }
+
+        std::string constraint;
+        std::size_t constraintStart = segment.find(':');
+        if (constraintStart != std::string::npos) {
+            constraint = ToLowerAscii(Trim(segment.substr(constraintStart + 1)));
+            segment = Trim(segment.substr(0, constraintStart));
+        }
+
+        const std::string* value = FindRouteValue(routeValues, segment);
+        if (value == nullptr) {
+            if (error != nullptr) {
+                *error = "Missing route value for parameter '" + segment + "'.";
+            }
+            return std::nullopt;
+        }
+        if (!constraint.empty() && !MatchesRouteConstraint(*value, constraint)) {
+            if (error != nullptr) {
+                *error = "Route value for parameter '" + segment + "' does not satisfy constraint '" + constraint + "'.";
+            }
+            return std::nullopt;
+        }
+
+        path += catchAll ? UrlEncodeCatchAllPath(*value) : UrlEncode(*value);
+    }
+
+    if (path.empty()) {
+        path = "/";
+    }
+    if (!queryValues.empty()) {
+        bool first = true;
+        for (const auto& [name, value] : queryValues) {
+            if (name.empty()) {
+                if (error != nullptr) {
+                    *error = "Query parameter name cannot be empty.";
+                }
+                return std::nullopt;
+            }
+            path.push_back(first ? '?' : '&');
+            first = false;
+            path += UrlEncode(name);
+            path.push_back('=');
+            path += UrlEncode(value);
+        }
+    }
+    return path;
+}
+
+void ValidateOpenApiParameter(const OpenApiParameter& parameter, std::string_view optionName) {
+    std::string name = Trim(parameter.Name);
+    std::string location = ToLowerAscii(Trim(parameter.In));
+    if (name.empty()) {
+        throw std::invalid_argument(std::string(optionName) + "::Name cannot be empty.");
+    }
+    if (location.empty()) {
+        throw std::invalid_argument(std::string(optionName) + "::In cannot be empty.");
+    }
+    if (location != "query" && location != "header" && location != "path" && location != "cookie") {
+        throw std::invalid_argument(std::string(optionName) + "::In must be query, header, path, or cookie.");
+    }
+    ValidateHeaderValue(name, std::string(optionName) + "::Name");
+    if (location == "header") {
+        ValidateHeaderName(name, std::string(optionName) + "::Name");
+    }
+    if (!parameter.SchemaType.empty()) {
+        ValidateHeaderValue(parameter.SchemaType, std::string(optionName) + "::SchemaType");
+    }
+    if (!parameter.SchemaFormat.empty()) {
+        ValidateHeaderValue(parameter.SchemaFormat, std::string(optionName) + "::SchemaFormat");
+    }
+    if (!parameter.ItemsSchemaType.empty()) {
+        ValidateHeaderValue(parameter.ItemsSchemaType, std::string(optionName) + "::ItemsSchemaType");
+    }
+    if (!parameter.ItemsSchemaFormat.empty()) {
+        ValidateHeaderValue(parameter.ItemsSchemaFormat, std::string(optionName) + "::ItemsSchemaFormat");
+    }
+}
+
+void ValidateOpenApiSecurityScheme(const OpenApiSecurityScheme& scheme, std::string_view optionName) {
+    std::string name = Trim(scheme.Name);
+    std::string type = ToLowerAscii(Trim(scheme.Type));
+    if (name.empty()) {
+        throw std::invalid_argument(std::string(optionName) + "::Name cannot be empty.");
+    }
+    ValidateHeaderName(name, std::string(optionName) + "::Name");
+    if (type != "apikey" && type != "http") {
+        throw std::invalid_argument(std::string(optionName) + "::Type must be apiKey or http.");
+    }
+    if (type == "apikey") {
+        std::string location = ToLowerAscii(Trim(scheme.In.empty() ? std::string("header") : scheme.In));
+        if (location != "header" && location != "query" && location != "cookie") {
+            throw std::invalid_argument(std::string(optionName) + "::In must be header, query, or cookie for apiKey schemes.");
+        }
+        std::string parameterName = Trim(scheme.ParameterName.empty() ? std::string("Authorization") : scheme.ParameterName);
+        if (parameterName.empty()) {
+            throw std::invalid_argument(std::string(optionName) + "::ParameterName cannot be empty.");
+        }
+        if (location == "header") {
+            ValidateHeaderName(parameterName, std::string(optionName) + "::ParameterName");
+        } else {
+            ValidateHeaderValue(parameterName, std::string(optionName) + "::ParameterName");
+        }
+    } else {
+        std::string httpScheme = Trim(scheme.Scheme.empty() ? std::string("bearer") : scheme.Scheme);
+        ValidateHeaderName(httpScheme, std::string(optionName) + "::Scheme");
+    }
+}
+
+void ValidateOpenApiOptions(const OpenApiOptions& options) {
+    (void)NormalizeFrameworkEndpointPath(options.Path, "OpenApiOptions::Path", "/openapi.json");
+    if (Trim(options.Info.Title).empty()) {
+        throw std::invalid_argument("OpenApiOptions::Info.Title cannot be empty.");
+    }
+    if (Trim(options.Info.Version).empty()) {
+        throw std::invalid_argument("OpenApiOptions::Info.Version cannot be empty.");
+    }
+    for (std::size_t index = 0; index < options.ServerUrls.size(); ++index) {
+        std::string url = Trim(options.ServerUrls[index]);
+        if (url.empty()) {
+            continue;
+        }
+        ValidateHeaderValue(url, "OpenApiOptions::ServerUrls[" + std::to_string(index) + "]");
+    }
+
+    std::vector<std::string> schemeNames;
+    for (std::size_t index = 0; index < options.SecuritySchemes.size(); ++index) {
+        std::string optionName = "OpenApiOptions::SecuritySchemes[" + std::to_string(index) + "]";
+        ValidateOpenApiSecurityScheme(options.SecuritySchemes[index], optionName);
+        std::string name = Trim(options.SecuritySchemes[index].Name);
+        if (ContainsTokenIgnoreCase(schemeNames, name)) {
+            throw std::invalid_argument("OpenApiOptions::SecuritySchemes contains a duplicate scheme: " + name);
+        }
+        schemeNames.push_back(std::move(name));
+    }
+    if (!Trim(options.DefaultSecurityScheme).empty() &&
+        !ContainsTokenIgnoreCase(schemeNames, Trim(options.DefaultSecurityScheme))) {
+        throw std::invalid_argument("OpenApiOptions::DefaultSecurityScheme must reference a registered security scheme.");
+    }
+}
+
+void ValidateSwaggerUiOptions(const SwaggerUiOptions& options) {
+    (void)NormalizeFrameworkEndpointPath(options.Path, "SwaggerUiOptions::Path", "/docs");
+    (void)NormalizeFrameworkEndpointPath(options.OpenApiPath, "SwaggerUiOptions::OpenApiPath", "/openapi.json");
+    if (!options.Title.empty()) {
+        ValidateHeaderValue(options.Title, "SwaggerUiOptions::Title");
+    }
+}
+
 std::string OpenApiPathFromPattern(std::string pattern) {
     std::string result;
     result.reserve(pattern.size());
     for (std::size_t index = 0; index < pattern.size(); ++index) {
-        if (pattern[index] == '{' && index + 1 < pattern.size() && pattern[index + 1] == '*') {
+        if (pattern[index] == '{') {
+            std::size_t close = pattern.find('}', index + 1);
+            if (close == std::string::npos) {
+                result.push_back(pattern[index]);
+                continue;
+            }
+            std::string parameter = pattern.substr(index + 1, close - index - 1);
+            if (!parameter.empty() && parameter.front() == '*') {
+                parameter.erase(parameter.begin());
+            }
+            std::size_t constraint = parameter.find(':');
+            if (constraint != std::string::npos) {
+                parameter.erase(constraint);
+            }
             result.push_back('{');
-            ++index;
+            result += parameter;
+            result.push_back('}');
+            index = close;
         } else {
             result.push_back(pattern[index]);
         }
@@ -2319,7 +4944,7 @@ std::vector<std::string> OpenApiMethodsForEndpoint(const RouteEndpoint& endpoint
     if (!endpoint.Methods.empty()) {
         return endpoint.Methods;
     }
-    return { "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS" };
+    return { "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS" };
 }
 
 std::string OpenApiMethodName(std::string method) {
@@ -2347,12 +4972,33 @@ std::string GenerateOperationId(const RouteEndpoint& endpoint, const std::string
     return operation.empty() ? "operation" : operation;
 }
 
-JsonObject CreateOpenApiSchema(std::string type) {
+JsonObject CreateOpenApiSchema(std::string type, std::string format = {}) {
     JsonObject schema;
     if (type.empty()) {
         type = "string";
     }
     schema.Add("type", JsonNode::Create(type));
+    if (!format.empty()) {
+        schema.Add("format", JsonNode::Create(format));
+    }
+    return schema;
+}
+
+JsonObject CreateOpenApiParameterSchema(const OpenApiParameter& parameter) {
+    if (!parameter.IsArray) {
+        return CreateOpenApiSchema(parameter.SchemaType, parameter.SchemaFormat);
+    }
+
+    std::string itemType = parameter.ItemsSchemaType.empty()
+        ? parameter.SchemaType
+        : parameter.ItemsSchemaType;
+    std::string itemFormat = parameter.ItemsSchemaFormat.empty()
+        ? parameter.SchemaFormat
+        : parameter.ItemsSchemaFormat;
+
+    JsonObject schema;
+    schema.Add("type", JsonNode::Create("array"));
+    schema.Add("items", CreateOpenApiSchema(std::move(itemType), std::move(itemFormat)));
     return schema;
 }
 
@@ -2368,7 +5014,7 @@ void AddOpenApiParameter(JsonArray& parameters, const OpenApiParameter& paramete
     if (!parameter.Description.empty()) {
         item.Add("description", JsonNode::Create(parameter.Description));
     }
-    item.Add("schema", CreateOpenApiSchema(parameter.SchemaType));
+    item.Add("schema", CreateOpenApiParameterSchema(parameter));
     parameters.Add(item);
 }
 
@@ -2486,7 +5132,8 @@ JsonObject CreateOpenApiOperation(
         OpenApiParameter parameter;
         parameter.Name = segment.Name;
         parameter.In = "path";
-        parameter.SchemaType = "string";
+        parameter.SchemaType = RouteConstraintSchemaType(segment.Constraint);
+        parameter.SchemaFormat = RouteConstraintSchemaFormat(segment.Constraint);
         parameter.Required = true;
         AddOpenApiParameter(parameters, parameter);
     }
@@ -2508,6 +5155,16 @@ JsonObject CreateOpenApiOperation(
         for (const OpenApiResponse& response : endpoint.OpenApiResponses) {
             AddOpenApiResponse(responses, response);
         }
+    }
+
+    if (!JoinRequestBodyContentTypes(endpoint.OpenApiRequestBodies).empty() &&
+        !HasOpenApiResponse(responses, 415)) {
+        AddOpenApiResponse(responses, OpenApiResponse{ 415, "application/problem+json", "Unsupported Media Type" });
+    }
+
+    if (!SuccessResponseContentTypes(endpoint.OpenApiResponses).empty() &&
+        !HasOpenApiResponse(responses, 406)) {
+        AddOpenApiResponse(responses, OpenApiResponse{ 406, "application/problem+json", "Not Acceptable" });
     }
 
     if (EndpointHasOpenApiAuthorization(endpoint, authorizationOptions)) {
@@ -2944,58 +5601,73 @@ bool JsonAsInt64(const System::Text::Json::JsonElement& value, long long& out) {
     return false;
 }
 
-std::vector<std::string> JsonAsStringList(const System::Text::Json::JsonElement& value) {
+std::vector<std::string> JsonAsStringList(const System::Text::Json::JsonElement& value, std::string_view name) {
     std::vector<std::string> result;
     if (value.ValueKind() == System::Text::Json::JsonValueKind::Array) {
+        std::size_t index = 0;
         for (const auto& item : value.EnumerateArray()) {
             auto text = JsonAsString(item);
-            if (text) {
-                result.push_back(*text);
+            if (!text) {
+                throw std::invalid_argument(std::string(name) + "[" + std::to_string(index) + "] must be a string value.");
             }
+            result.push_back(*text);
+            ++index;
         }
     } else {
         auto text = JsonAsString(value);
-        if (text) {
-            result.push_back(*text);
+        if (!text) {
+            throw std::invalid_argument(std::string(name) + " must be a string or array of strings.");
         }
+        result.push_back(*text);
     }
     return result;
 }
 
 void ApplyString(const System::Text::Json::JsonElement& object, std::string_view name, std::string& target) {
     System::Text::Json::JsonElement value;
-    if (TryGetPropertyIgnoreCase(object, name, value) && !IsJsonNullish(value)) {
-        auto text = JsonAsString(value);
-        if (text) {
-            target = *text;
-        }
+    if (!TryGetPropertyIgnoreCase(object, name, value) || IsJsonNullish(value)) {
+        return;
     }
+    auto text = JsonAsString(value);
+    if (!text) {
+        throw std::invalid_argument(std::string(name) + " must be a string value.");
+    }
+    target = *text;
 }
 
 void ApplyWString(const System::Text::Json::JsonElement& object, std::string_view name, std::wstring& target) {
     System::Text::Json::JsonElement value;
-    if (TryGetPropertyIgnoreCase(object, name, value) && !IsJsonNullish(value)) {
-        auto text = JsonAsString(value);
-        if (text) {
-            target = Utf8ToWide(*text);
-        }
+    if (!TryGetPropertyIgnoreCase(object, name, value) || IsJsonNullish(value)) {
+        return;
     }
+    auto text = JsonAsString(value);
+    if (!text) {
+        throw std::invalid_argument(std::string(name) + " must be a string value.");
+    }
+    target = Utf8ToWide(*text);
 }
 
 void ApplyBool(const System::Text::Json::JsonElement& object, std::string_view name, bool& target) {
     System::Text::Json::JsonElement value;
     bool parsed = false;
-    if (TryGetPropertyIgnoreCase(object, name, value) && JsonAsBool(value, parsed)) {
-        target = parsed;
+    if (!TryGetPropertyIgnoreCase(object, name, value) || IsJsonNullish(value)) {
+        return;
     }
+    if (!JsonAsBool(value, parsed)) {
+        throw std::invalid_argument(std::string(name) + " must be a boolean value.");
+    }
+    target = parsed;
 }
 
 template <class Integer>
 void ApplyInteger(const System::Text::Json::JsonElement& object, std::string_view name, Integer& target) {
     System::Text::Json::JsonElement value;
     long long parsed = 0;
-    if (!TryGetPropertyIgnoreCase(object, name, value) || !JsonAsInt64(value, parsed)) {
+    if (!TryGetPropertyIgnoreCase(object, name, value) || IsJsonNullish(value)) {
         return;
+    }
+    if (!JsonAsInt64(value, parsed)) {
+        throw std::invalid_argument(std::string(name) + " must be an integer value.");
     }
     if constexpr (std::is_unsigned_v<Integer>) {
         if (parsed < 0 || static_cast<unsigned long long>(parsed) > static_cast<unsigned long long>((std::numeric_limits<Integer>::max)())) {
@@ -3013,23 +5685,31 @@ void ApplyInteger(const System::Text::Json::JsonElement& object, std::string_vie
 void ApplySeconds(const System::Text::Json::JsonElement& object, std::string_view name, std::chrono::seconds& target) {
     System::Text::Json::JsonElement value;
     long long parsed = 0;
-    if (TryGetPropertyIgnoreCase(object, name, value) && JsonAsInt64(value, parsed)) {
-        if (parsed < 0) {
-            throw std::out_of_range(std::string(name) + " cannot be negative.");
-        }
-        target = std::chrono::seconds(parsed);
+    if (!TryGetPropertyIgnoreCase(object, name, value) || IsJsonNullish(value)) {
+        return;
     }
+    if (!JsonAsInt64(value, parsed)) {
+        throw std::invalid_argument(std::string(name) + " must be an integer value.");
+    }
+    if (parsed < 0) {
+        throw std::out_of_range(std::string(name) + " cannot be negative.");
+    }
+    target = std::chrono::seconds(parsed);
 }
 
 void ApplyMilliseconds(const System::Text::Json::JsonElement& object, std::string_view name, std::chrono::milliseconds& target) {
     System::Text::Json::JsonElement value;
     long long parsed = 0;
-    if (TryGetPropertyIgnoreCase(object, name, value) && JsonAsInt64(value, parsed)) {
-        if (parsed < 0) {
-            throw std::out_of_range(std::string(name) + " cannot be negative.");
-        }
-        target = std::chrono::milliseconds(parsed);
+    if (!TryGetPropertyIgnoreCase(object, name, value) || IsJsonNullish(value)) {
+        return;
     }
+    if (!JsonAsInt64(value, parsed)) {
+        throw std::invalid_argument(std::string(name) + " must be an integer value.");
+    }
+    if (parsed < 0) {
+        throw std::out_of_range(std::string(name) + " cannot be negative.");
+    }
+    target = std::chrono::milliseconds(parsed);
 }
 
 MachineConfigMode ParseMachineConfigMode(std::string value) {
@@ -3051,18 +5731,20 @@ MachineConfigMode ParseMachineConfigMode(std::string value) {
 
 void ApplyMachineConfigMode(const System::Text::Json::JsonElement& object, std::string_view name, MachineConfigMode& target) {
     System::Text::Json::JsonElement value;
-    if (TryGetPropertyIgnoreCase(object, name, value) && !IsJsonNullish(value)) {
-        auto text = JsonAsString(value);
-        if (text) {
-            target = ParseMachineConfigMode(*text);
-        }
+    if (!TryGetPropertyIgnoreCase(object, name, value) || IsJsonNullish(value)) {
+        return;
     }
+    auto text = JsonAsString(value);
+    if (!text) {
+        throw std::invalid_argument(std::string(name) + " must be a string value.");
+    }
+    target = ParseMachineConfigMode(*text);
 }
 
 void ApplyStringList(const System::Text::Json::JsonElement& object, std::string_view name, std::vector<std::string>& target) {
     System::Text::Json::JsonElement value;
     if (TryGetPropertyIgnoreCase(object, name, value) && !IsJsonNullish(value)) {
-        target = JsonAsStringList(value);
+        target = JsonAsStringList(value, name);
     }
 }
 
@@ -3082,12 +5764,32 @@ void ApplyTimeoutOptions(const System::Text::Json::JsonElement& object, HttpSysT
     ApplyInteger(object, "minSendRateBytesPerSecond", target.MinSendRateBytesPerSecond);
 }
 
+void ApplyBackpressureOptions(const System::Text::Json::JsonElement& object, HttpSysBackpressureOptions& target) {
+    ApplyInteger(object, "stoppingStatusCode", target.StoppingStatusCode);
+    ApplyString(object, "stoppingDetail", target.StoppingDetail);
+    ApplyInteger(object, "stoppingRetryAfterSeconds", target.StoppingRetryAfterSeconds);
+    ApplyInteger(object, "overloadedStatusCode", target.OverloadedStatusCode);
+    ApplyString(object, "overloadedDetail", target.OverloadedDetail);
+    ApplyInteger(object, "overloadedRetryAfterSeconds", target.OverloadedRetryAfterSeconds);
+}
+
 void ApplyProblemDetailsOptions(const System::Text::Json::JsonElement& object, ProblemDetailsOptions& target) {
     ApplyString(object, "defaultType", target.DefaultType);
     ApplyBool(object, "includeType", target.IncludeType);
     ApplyBool(object, "includeInstance", target.IncludeInstance);
     ApplyBool(object, "includeTraceIdentifier", target.IncludeTraceIdentifier);
     ApplyString(object, "traceIdentifierExtensionName", target.TraceIdentifierExtensionName);
+}
+
+void ApplyFormOptions(const System::Text::Json::JsonElement& object, FormOptions& target) {
+    ApplyInteger(object, "valueCountLimit", target.ValueCountLimit);
+    ApplyInteger(object, "keyLengthLimit", target.KeyLengthLimit);
+    ApplyInteger(object, "valueLengthLimit", target.ValueLengthLimit);
+    ApplyInteger(object, "multipartBoundaryLengthLimit", target.MultipartBoundaryLengthLimit);
+    ApplyInteger(object, "multipartFileCountLimit", target.MultipartFileCountLimit);
+    ApplyInteger(object, "multipartHeadersCountLimit", target.MultipartHeadersCountLimit);
+    ApplyInteger(object, "multipartHeadersLengthLimit", target.MultipartHeadersLengthLimit);
+    ApplyInteger(object, "multipartBodyLengthLimit", target.MultipartBodyLengthLimit);
 }
 
 void ApplySslBindingOptions(const System::Text::Json::JsonElement& object, SslCertificateBinding& target) {
@@ -3130,6 +5832,8 @@ void ApplyHttpSysOptions(const System::Text::Json::JsonElement& object, HttpSysO
     ApplyInteger(object, "workerCount", target.WorkerCount);
     ApplyInteger(object, "requestBufferSize", target.RequestBufferSize);
     ApplyInteger(object, "maxRequestBodyBytes", target.MaxRequestBodyBytes);
+    ApplyInteger(object, "maxRequestUrlBytes", target.MaxRequestUrlBytes);
+    ApplyInteger(object, "maxRequestHeaderBytes", target.MaxRequestHeaderBytes);
     ApplyInteger(object, "maxConcurrentRequests", target.MaxConcurrentRequests);
     ApplyMilliseconds(object, "stopTimeoutMs", target.StopTimeout);
     ApplyBool(object, "addServerHeader", target.AddServerHeader);
@@ -3141,6 +5845,9 @@ void ApplyHttpSysOptions(const System::Text::Json::JsonElement& object, HttpSysO
     }
     if (TryGetPropertyIgnoreCase(object, "timeouts", section) && section.ValueKind() == System::Text::Json::JsonValueKind::Object) {
         ApplyTimeoutOptions(section, target.Timeouts);
+    }
+    if (TryGetPropertyIgnoreCase(object, "backpressure", section) && section.ValueKind() == System::Text::Json::JsonValueKind::Object) {
+        ApplyBackpressureOptions(section, target.Backpressure);
     }
     if (TryGetPropertyIgnoreCase(object, "sslCertificateBindings", section) ||
         TryGetPropertyIgnoreCase(object, "sslBindings", section)) {
@@ -3162,6 +5869,16 @@ void ApplyWebApplicationOptions(const System::Text::Json::JsonElement& root, Web
     }
     if (TryGetPropertyIgnoreCase(root, "problemDetails", section) && section.ValueKind() == System::Text::Json::JsonValueKind::Object) {
         ApplyProblemDetailsOptions(section, target.ProblemDetails);
+    }
+    if (TryGetPropertyIgnoreCase(root, "formOptions", section) ||
+        TryGetPropertyIgnoreCase(root, "forms", section)) {
+        if (IsJsonNullish(section)) {
+            return;
+        }
+        if (section.ValueKind() != System::Text::Json::JsonValueKind::Object) {
+            throw std::invalid_argument("formOptions must be a JSON object.");
+        }
+        ApplyFormOptions(section, target.Forms);
     }
 }
 
@@ -3320,6 +6037,15 @@ void ApplyEnvironmentTimeoutOptions(const std::string& prefix, HttpSysTimeoutOpt
     ApplyEnvironmentInteger(prefix, "HTTP_SYS__TIMEOUTS__MIN_SEND_RATE_BYTES_PER_SECOND", target.MinSendRateBytesPerSecond);
 }
 
+void ApplyEnvironmentBackpressureOptions(const std::string& prefix, HttpSysBackpressureOptions& target) {
+    ApplyEnvironmentInteger(prefix, "HTTP_SYS__BACKPRESSURE__STOPPING_STATUS_CODE", target.StoppingStatusCode);
+    ApplyEnvironmentString(prefix, "HTTP_SYS__BACKPRESSURE__STOPPING_DETAIL", target.StoppingDetail);
+    ApplyEnvironmentInteger(prefix, "HTTP_SYS__BACKPRESSURE__STOPPING_RETRY_AFTER_SECONDS", target.StoppingRetryAfterSeconds);
+    ApplyEnvironmentInteger(prefix, "HTTP_SYS__BACKPRESSURE__OVERLOADED_STATUS_CODE", target.OverloadedStatusCode);
+    ApplyEnvironmentString(prefix, "HTTP_SYS__BACKPRESSURE__OVERLOADED_DETAIL", target.OverloadedDetail);
+    ApplyEnvironmentInteger(prefix, "HTTP_SYS__BACKPRESSURE__OVERLOADED_RETRY_AFTER_SECONDS", target.OverloadedRetryAfterSeconds);
+}
+
 void ApplyEnvironmentUrlReservationOptions(const std::string& prefix, UrlReservationOptions& target) {
     ApplyEnvironmentMachineConfigMode(prefix, "HTTP_SYS__URL_RESERVATION__MODE", target.Mode);
     ApplyEnvironmentWString(prefix, "HTTP_SYS__URL_RESERVATION__SECURITY_DESCRIPTOR", target.SecurityDescriptor);
@@ -3333,6 +6059,17 @@ void ApplyEnvironmentProblemDetailsOptions(const std::string& prefix, ProblemDet
     ApplyEnvironmentBool(prefix, "PROBLEM_DETAILS__INCLUDE_INSTANCE", target.IncludeInstance);
     ApplyEnvironmentBool(prefix, "PROBLEM_DETAILS__INCLUDE_TRACE_IDENTIFIER", target.IncludeTraceIdentifier);
     ApplyEnvironmentString(prefix, "PROBLEM_DETAILS__TRACE_IDENTIFIER_EXTENSION_NAME", target.TraceIdentifierExtensionName);
+}
+
+void ApplyEnvironmentFormOptions(const std::string& prefix, FormOptions& target) {
+    ApplyEnvironmentInteger(prefix, "FORM_OPTIONS__VALUE_COUNT_LIMIT", target.ValueCountLimit);
+    ApplyEnvironmentInteger(prefix, "FORM_OPTIONS__KEY_LENGTH_LIMIT", target.KeyLengthLimit);
+    ApplyEnvironmentInteger(prefix, "FORM_OPTIONS__VALUE_LENGTH_LIMIT", target.ValueLengthLimit);
+    ApplyEnvironmentInteger(prefix, "FORM_OPTIONS__MULTIPART_BOUNDARY_LENGTH_LIMIT", target.MultipartBoundaryLengthLimit);
+    ApplyEnvironmentInteger(prefix, "FORM_OPTIONS__MULTIPART_FILE_COUNT_LIMIT", target.MultipartFileCountLimit);
+    ApplyEnvironmentInteger(prefix, "FORM_OPTIONS__MULTIPART_HEADERS_COUNT_LIMIT", target.MultipartHeadersCountLimit);
+    ApplyEnvironmentInteger(prefix, "FORM_OPTIONS__MULTIPART_HEADERS_LENGTH_LIMIT", target.MultipartHeadersLengthLimit);
+    ApplyEnvironmentInteger(prefix, "FORM_OPTIONS__MULTIPART_BODY_LENGTH_LIMIT", target.MultipartBodyLengthLimit);
 }
 
 void ApplyEnvironmentSslBinding(const std::string& prefix, std::vector<SslCertificateBinding>& target) {
@@ -3369,12 +6106,15 @@ void ApplyEnvironmentHttpSysOptions(const std::string& prefix, HttpSysOptions& t
     ApplyEnvironmentInteger(prefix, "HTTP_SYS__WORKER_COUNT", target.WorkerCount);
     ApplyEnvironmentInteger(prefix, "HTTP_SYS__REQUEST_BUFFER_SIZE", target.RequestBufferSize);
     ApplyEnvironmentInteger(prefix, "HTTP_SYS__MAX_REQUEST_BODY_BYTES", target.MaxRequestBodyBytes);
+    ApplyEnvironmentInteger(prefix, "HTTP_SYS__MAX_REQUEST_URL_BYTES", target.MaxRequestUrlBytes);
+    ApplyEnvironmentInteger(prefix, "HTTP_SYS__MAX_REQUEST_HEADER_BYTES", target.MaxRequestHeaderBytes);
     ApplyEnvironmentInteger(prefix, "HTTP_SYS__MAX_CONCURRENT_REQUESTS", target.MaxConcurrentRequests);
     ApplyEnvironmentMilliseconds(prefix, "HTTP_SYS__STOP_TIMEOUT_MS", target.StopTimeout);
     ApplyEnvironmentBool(prefix, "HTTP_SYS__ADD_SERVER_HEADER", target.AddServerHeader);
     ApplyEnvironmentString(prefix, "HTTP_SYS__SERVER_HEADER", target.ServerHeader);
     ApplyEnvironmentUrlReservationOptions(prefix, target.UrlReservation);
     ApplyEnvironmentTimeoutOptions(prefix, target.Timeouts);
+    ApplyEnvironmentBackpressureOptions(prefix, target.Backpressure);
     ApplyEnvironmentSslBinding(prefix, target.SslCertificateBindings);
 }
 
@@ -3383,6 +6123,7 @@ void ApplyEnvironmentOptions(const std::string& prefix, WebApplicationOptions& t
     ApplyEnvironmentStringList(prefix, "URLS", target.HttpSys.UrlPrefixes);
     ApplyEnvironmentHttpSysOptions(prefix, target.HttpSys);
     ApplyEnvironmentProblemDetailsOptions(prefix, target.ProblemDetails);
+    ApplyEnvironmentFormOptions(prefix, target.Forms);
 }
 
 HTTP_HEADER_ID ResponseKnownHeaderId(std::string_view name, bool& known) {
@@ -3424,8 +6165,9 @@ HTTP_HEADER_ID ResponseKnownHeaderId(std::string_view name, bool& known) {
 
 class HttpSysServer {
 public:
-    HttpSysServer(HttpSysOptions options, Logger logger, bool detailedErrors, ProblemDetailsOptions problemDetailsOptions)
+    HttpSysServer(HttpSysOptions options, FormOptions formOptions, Logger logger, bool detailedErrors, ProblemDetailsOptions problemDetailsOptions)
         : options_(std::move(options)),
+          formOptions_(formOptions),
           logger_(std::move(logger)),
           detailedErrors_(detailedErrors),
           problemDetailsOptions_(std::move(problemDetailsOptions)) {
@@ -3440,71 +6182,84 @@ public:
             return;
         }
         handler_ = std::move(handler);
-        accepting_.store(false);
-        activeRequests_.store(0);
-        for (std::string& prefix : options_.UrlPrefixes) {
-            prefix = NormalizeUrlPrefix(std::move(prefix));
-        }
-        UrlReservationManager::Apply(options_.UrlPrefixes, options_.UrlReservation);
-        SslBindingManager::Apply(options_.SslCertificateBindings);
-
-        apiScope_ = std::make_unique<HttpApiScope>(HTTP_INITIALIZE_SERVER);
-
-        ULONG result = HttpCreateServerSession(HttpApiVersion, &serverSessionId_, 0);
-        if (result != NO_ERROR) {
-            throw HttpSysException("HttpCreateServerSession", result);
-        }
-
-        result = HttpCreateUrlGroup(serverSessionId_, &urlGroupId_, 0);
-        if (result != NO_ERROR) {
-            throw HttpSysException("HttpCreateUrlGroup", result);
-        }
-
-        result = HttpCreateRequestQueue(HttpApiVersion, nullptr, nullptr, 0, &requestQueue_);
-        if (result != NO_ERROR) {
-            throw HttpSysException("HttpCreateRequestQueue", result);
-        }
-
-        HTTP_TIMEOUT_LIMIT_INFO timeoutInfo = BuildTimeoutInfo(options_.Timeouts);
-        result = HttpSetUrlGroupProperty(urlGroupId_, HttpServerTimeoutsProperty, &timeoutInfo, sizeof(timeoutInfo));
-        if (result != NO_ERROR) {
-            throw HttpSysException("HttpSetUrlGroupProperty(HttpServerTimeoutsProperty)", result);
-        }
-
-        HTTP_BINDING_INFO bindingInfo{};
-        bindingInfo.Flags.Present = 1;
-        bindingInfo.RequestQueueHandle = requestQueue_;
-        result = HttpSetUrlGroupProperty(urlGroupId_, HttpServerBindingProperty, &bindingInfo, sizeof(bindingInfo));
-        if (result != NO_ERROR) {
-            throw HttpSysException("HttpSetUrlGroupProperty(HttpServerBindingProperty)", result);
-        }
-
-        for (const std::string& prefix : options_.UrlPrefixes) {
-            std::wstring widePrefix = Utf8ToWide(prefix);
-            result = HttpAddUrlToUrlGroup(urlGroupId_, widePrefix.c_str(), 0, 0);
-            if (result != NO_ERROR) {
-                throw HttpSysException("HttpAddUrlToUrlGroup(" + prefix + ")", result);
+        try {
+            accepting_.store(false);
+            activeRequests_.store(0);
+            machineConfigurationApplied_ = UsesMachineConfiguration();
+            for (std::string& prefix : options_.UrlPrefixes) {
+                prefix = NormalizeUrlPrefix(std::move(prefix));
             }
-        }
+            UrlReservationManager::Apply(options_.UrlPrefixes, options_.UrlReservation);
+            SslBindingManager::Apply(options_.SslCertificateBindings);
+            if (ShouldSkipListenerAfterMachineConfiguration()) {
+                machineConfigurationApplied_ = false;
+                Log(logger_, LogLevel::Information,
+                    "HTTP.sys machine configuration processed; listener not started because delete mode was requested.");
+                return;
+            }
 
-        SetUrlGroupState(HttpEnabledStateActive);
-        accepting_.store(true);
-        running_.store(true);
-        std::uint32_t workerCount = options_.WorkerCount;
-        if (workerCount == 0) {
-            workerCount = std::max<std::uint32_t>(2, std::thread::hardware_concurrency());
+            apiScope_ = std::make_unique<HttpApiScope>(HTTP_INITIALIZE_SERVER);
+
+            ULONG result = HttpCreateServerSession(HttpApiVersion, &serverSessionId_, 0);
+            if (result != NO_ERROR) {
+                throw HttpSysException("HttpCreateServerSession", result);
+            }
+
+            result = HttpCreateUrlGroup(serverSessionId_, &urlGroupId_, 0);
+            if (result != NO_ERROR) {
+                throw HttpSysException("HttpCreateUrlGroup", result);
+            }
+
+            result = HttpCreateRequestQueue(HttpApiVersion, nullptr, nullptr, 0, &requestQueue_);
+            if (result != NO_ERROR) {
+                throw HttpSysException("HttpCreateRequestQueue", result);
+            }
+
+            HTTP_TIMEOUT_LIMIT_INFO timeoutInfo = BuildTimeoutInfo(options_.Timeouts);
+            result = HttpSetUrlGroupProperty(urlGroupId_, HttpServerTimeoutsProperty, &timeoutInfo, sizeof(timeoutInfo));
+            if (result != NO_ERROR) {
+                throw HttpSysException("HttpSetUrlGroupProperty(HttpServerTimeoutsProperty)", result);
+            }
+
+            HTTP_BINDING_INFO bindingInfo{};
+            bindingInfo.Flags.Present = 1;
+            bindingInfo.RequestQueueHandle = requestQueue_;
+            result = HttpSetUrlGroupProperty(urlGroupId_, HttpServerBindingProperty, &bindingInfo, sizeof(bindingInfo));
+            if (result != NO_ERROR) {
+                throw HttpSysException("HttpSetUrlGroupProperty(HttpServerBindingProperty)", result);
+            }
+
+            for (const std::string& prefix : options_.UrlPrefixes) {
+                std::wstring widePrefix = Utf8ToWide(prefix);
+                result = HttpAddUrlToUrlGroup(urlGroupId_, widePrefix.c_str(), 0, 0);
+                if (result != NO_ERROR) {
+                    throw HttpSysException("HttpAddUrlToUrlGroup(" + prefix + ")", result);
+                }
+            }
+
+            SetUrlGroupState(HttpEnabledStateActive);
+            accepting_.store(true);
+            running_.store(true);
+            std::uint32_t workerCount = options_.WorkerCount;
+            if (workerCount == 0) {
+                workerCount = std::max<std::uint32_t>(2, std::thread::hardware_concurrency());
+            }
+            workers_.reserve(workerCount);
+            for (std::uint32_t index = 0; index < workerCount; ++index) {
+                workers_.emplace_back([this] { WorkerLoop(); });
+            }
+            Log(logger_, LogLevel::Information, "HTTP.sys server started.");
+        } catch (...) {
+            Stop();
+            throw;
         }
-        workers_.reserve(workerCount);
-        for (std::uint32_t index = 0; index < workerCount; ++index) {
-            workers_.emplace_back([this] { WorkerLoop(); });
-        }
-        Log(logger_, LogLevel::Information, "HTTP.sys server started.");
     }
 
     void Stop() {
         if (!running_.exchange(false)) {
             accepting_.store(false);
             CleanupHandles();
+            CleanupMachineConfiguration();
             return;
         }
 
@@ -3527,24 +6282,7 @@ public:
         }
         workers_.clear();
         CleanupHandles();
-
-        if (options_.UrlReservation.RemoveOnStop) {
-            try {
-                UrlReservationManager::Remove(options_.UrlPrefixes);
-            } catch (const std::exception& ex) {
-                Log(logger_, LogLevel::Warning, ex.what());
-            }
-        }
-        for (const SslCertificateBinding& binding : options_.SslCertificateBindings) {
-            if (!binding.RemoveOnStop) {
-                continue;
-            }
-            try {
-                SslBindingManager::Remove(binding);
-            } catch (const std::exception& ex) {
-                Log(logger_, LogLevel::Warning, ex.what());
-            }
-        }
+        CleanupMachineConfiguration();
         Log(logger_, LogLevel::Information, "HTTP.sys server stopped.");
     }
 
@@ -3663,6 +6401,48 @@ private:
         apiScope_.reset();
     }
 
+    bool UsesMachineConfiguration() const noexcept {
+        if (options_.UrlReservation.Mode != UrlAclMode::Disabled) {
+            return true;
+        }
+        return std::any_of(options_.SslCertificateBindings.begin(), options_.SslCertificateBindings.end(), [](const SslCertificateBinding& binding) {
+            return binding.Mode != MachineConfigMode::Disabled;
+        });
+    }
+
+    bool ShouldSkipListenerAfterMachineConfiguration() const noexcept {
+        if (options_.UrlReservation.Mode == UrlAclMode::Delete) {
+            return true;
+        }
+        return std::any_of(options_.SslCertificateBindings.begin(), options_.SslCertificateBindings.end(), [](const SslCertificateBinding& binding) {
+            return binding.Mode == MachineConfigMode::Delete;
+        });
+    }
+
+    void CleanupMachineConfiguration() noexcept {
+        if (!machineConfigurationApplied_) {
+            return;
+        }
+        machineConfigurationApplied_ = false;
+        if (options_.UrlReservation.RemoveOnStop) {
+            try {
+                UrlReservationManager::Remove(options_.UrlPrefixes);
+            } catch (const std::exception& ex) {
+                Log(logger_, LogLevel::Warning, ex.what());
+            }
+        }
+        for (const SslCertificateBinding& binding : options_.SslCertificateBindings) {
+            if (!binding.RemoveOnStop) {
+                continue;
+            }
+            try {
+                SslBindingManager::Remove(binding);
+            } catch (const std::exception& ex) {
+                Log(logger_, LogLevel::Warning, ex.what());
+            }
+        }
+    }
+
     void WorkerLoop() {
         while (running_.load()) {
             std::vector<std::uint8_t> buffer(std::max<std::uint32_t>(options_.RequestBufferSize, sizeof(HTTP_REQUEST) + 2048));
@@ -3707,8 +6487,13 @@ private:
     std::string ReadBody(const HTTP_REQUEST& request) {
         std::string body;
         auto append = [&](const void* data, std::size_t size) {
-            if (options_.MaxRequestBodyBytes != 0 && body.size() + size > options_.MaxRequestBodyBytes) {
-                throw std::length_error("Request body exceeds MaxRequestBodyBytes.");
+            std::uint64_t maxBodyBytes = options_.MaxRequestBodyBytes;
+            if (maxBodyBytes != 0) {
+                std::uint64_t currentSize = static_cast<std::uint64_t>(body.size());
+                std::uint64_t incomingSize = static_cast<std::uint64_t>(size);
+                if (currentSize > maxBodyBytes || incomingSize > maxBodyBytes - currentSize) {
+                    throw std::length_error("Request body exceeds MaxRequestBodyBytes.");
+                }
             }
             body.append(static_cast<const char*>(data), size);
         };
@@ -3750,6 +6535,7 @@ private:
         context.traceIdentifier_ = GenerateTraceIdentifier();
         HttpRequest& request = context.request_;
         request.method_ = MethodFromHttpRequest(source);
+        EnsureRequestUrlSizeLimit(static_cast<std::uint64_t>(source.RawUrlLength), options_);
         request.rawUrl_ = source.pRawUrl == nullptr ? std::string() : std::string(source.pRawUrl, source.RawUrlLength);
         if (source.CookedUrl.pAbsPath != nullptr && source.CookedUrl.AbsPathLength > 0) {
             request.path_ = WideToUtf8(std::wstring_view(source.CookedUrl.pAbsPath, source.CookedUrl.AbsPathLength / sizeof(wchar_t)));
@@ -3760,9 +6546,13 @@ private:
         if (source.CookedUrl.pQueryString != nullptr && source.CookedUrl.QueryStringLength > 0) {
             request.queryString_ = WideToUtf8(std::wstring_view(source.CookedUrl.pQueryString, source.CookedUrl.QueryStringLength / sizeof(wchar_t)));
         }
-        request.query_ = ParseQueryString(request.queryString_);
+        EnsureRequestUrlSizeLimit(RequestUrlBytes(request), options_);
+        ParsedValueCollection parsedQuery = ParseUrlEncodedValues(request.queryString_);
+        request.query_ = std::move(parsedQuery.Values);
+        request.queryValues_ = std::move(parsedQuery.ValueLists);
         request.remoteAddress_ = SocketAddressToString(source.Address.pRemoteAddress);
         CopyRequestHeaders(source.Headers, request.headers_);
+        EnsureRequestHeaderSizeLimit(request.headers_, options_);
         if (source.CookedUrl.pHost != nullptr && source.CookedUrl.HostLength > 0) {
             request.host_ = WideToUtf8(std::wstring_view(source.CookedUrl.pHost, source.CookedUrl.HostLength / sizeof(wchar_t)));
         }
@@ -3780,29 +6570,18 @@ private:
         } else {
             request.scheme_ = "http";
         }
+        request.formOptions_ = formOptions_;
         request.body_ = ReadBody(source);
         return context;
     }
 
     HttpResult ExecuteHandler(HttpContext& context) {
-        try {
-            return handler_(context);
-        } catch (const std::length_error& ex) {
-            Log(logger_, LogLevel::Warning, ex.what());
-            return CreateErrorResult(context, "Payload Too Large", ex, 413, detailedErrors_, problemDetailsOptions_, &logger_);
-        } catch (const System::Text::Json::JsonException& ex) {
-            Log(logger_, LogLevel::Warning, ex.what());
-            return CreateErrorResult(context, "Invalid JSON", ex, 400, detailedErrors_, problemDetailsOptions_, &logger_);
-        } catch (const std::exception& ex) {
-            Log(logger_, LogLevel::Error, ex.what());
-            return CreateErrorResult(context, "Internal Server Error", ex, 500, detailedErrors_, problemDetailsOptions_, &logger_);
-        } catch (...) {
-            Log(logger_, LogLevel::Error, "Unknown exception.");
-            return CreateErrorResult(context, "Internal Server Error", "Unknown exception.", 500, detailedErrors_, problemDetailsOptions_, &logger_);
-        }
+        return ExecuteWithErrorHandling(context, [this](HttpContext& current) {
+            return handler_(current);
+        }, detailedErrors_, problemDetailsOptions_, &logger_);
     }
 
-    void SendServiceUnavailable(const HTTP_REQUEST& source, std::string detail, int retryAfterSeconds) {
+    void SendBackpressureResponse(const HTTP_REQUEST& source, int statusCode, std::string detail, int retryAfterSeconds) {
         HttpContext context;
         context.traceIdentifier_ = GenerateTraceIdentifier();
         context.request_.method_ = MethodFromHttpRequest(source);
@@ -3819,7 +6598,7 @@ private:
             context.request_.path_ = "/";
         }
 
-        HttpResult result = CreateProblemResult(context, "Service Unavailable", std::move(detail), 503, problemDetailsOptions_, &logger_);
+        HttpResult result = CreateProblemResult(context, StatusReason(statusCode), std::move(detail), statusCode, problemDetailsOptions_, &logger_);
         if (retryAfterSeconds > 0) {
             result.Header("Retry-After", std::to_string(retryAfterSeconds));
         }
@@ -3829,11 +6608,21 @@ private:
 
     void HandleRequest(const HTTP_REQUEST& source) {
         if (!accepting_.load()) {
-            SendServiceUnavailable(source, "Server is stopping.", 5);
+            const HttpSysBackpressureOptions& backpressure = options_.Backpressure;
+            SendBackpressureResponse(
+                source,
+                backpressure.StoppingStatusCode,
+                backpressure.StoppingDetail,
+                backpressure.StoppingRetryAfterSeconds);
             return;
         }
         if (!TryAcquireRequestSlot()) {
-            SendServiceUnavailable(source, "Too many concurrent requests.", 1);
+            const HttpSysBackpressureOptions& backpressure = options_.Backpressure;
+            SendBackpressureResponse(
+                source,
+                backpressure.OverloadedStatusCode,
+                backpressure.OverloadedDetail,
+                backpressure.OverloadedRetryAfterSeconds);
             return;
         }
 
@@ -3843,6 +6632,13 @@ private:
             context = BuildContext(source);
             HttpResult result = ExecuteHandler(context);
             result.Apply(context.Response());
+        } catch (const RequestRejectedException& ex) {
+            context.response_ = HttpResponse();
+            if (context.traceIdentifier_.empty()) {
+                context.traceIdentifier_ = GenerateTraceIdentifier();
+            }
+            Log(logger_, LogLevel::Warning, ex.what());
+            CreateProblemResult(context, ex.Title(), ex.what(), ex.StatusCode(), problemDetailsOptions_, &logger_).Apply(context.Response());
         } catch (const std::length_error& ex) {
             context.response_ = HttpResponse();
             if (context.traceIdentifier_.empty()) {
@@ -3873,10 +6669,14 @@ private:
         std::vector<std::pair<std::string, std::string>> unknownStorage;
         unknownStorage.reserve(source.Headers().Items().size() + 3);
 
-        bool hasContentLength = source.Headers().Contains("Content-Length");
+        bool omitContentLength = StatusCodeForbidsResponseBody(source.StatusCode());
+        bool hasContentLength = !omitContentLength && source.Headers().Contains("Content-Length");
         bool hasServer = source.Headers().Contains("Server");
 
         auto addHeader = [&](const std::string& name, const std::string& value) {
+            if (omitContentLength && EqualsIgnoreCase(name, "Content-Length")) {
+                return;
+            }
             bool known = false;
             HTTP_HEADER_ID id = ResponseKnownHeaderId(name, known);
             if (known && !EqualsIgnoreCase(name, "Set-Cookie")) {
@@ -3895,12 +6695,10 @@ private:
             addHeader("Server", options_.ServerHeader);
         }
 
-        bool suppressBody = EqualsIgnoreCase(context.Request().Method(), "HEAD") ||
-            source.StatusCode() == 204 ||
-            source.StatusCode() == 304;
+        bool suppressBody = ShouldSuppressResponseBody(context.Request().Method(), source.StatusCode());
 
         std::string contentLength;
-        if (!hasContentLength) {
+        if (!hasContentLength && !omitContentLength) {
             contentLength = std::to_string(source.Body().size());
             addHeader("Content-Length", contentLength);
         }
@@ -3944,6 +6742,7 @@ private:
     }
 
     HttpSysOptions options_;
+    FormOptions formOptions_;
     Logger logger_;
     bool detailedErrors_ = false;
     ProblemDetailsOptions problemDetailsOptions_;
@@ -3958,10 +6757,11 @@ private:
     std::mutex activeRequestsMutex_;
     std::condition_variable activeRequestsDrained_;
     std::vector<std::thread> workers_;
+    bool machineConfigurationApplied_ = false;
 };
 
 HttpSysException::HttpSysException(std::string operation, unsigned long errorCode)
-    : std::runtime_error(operation + " failed: " + FormatWin32Message(errorCode) + " (" + std::to_string(errorCode) + ")"),
+    : std::runtime_error(operation + " failed: " + FormatWin32Error(errorCode)),
       operation_(std::move(operation)),
       errorCode_(errorCode) {
 }
@@ -3975,7 +6775,7 @@ unsigned long HttpSysException::ErrorCode() const noexcept {
 }
 
 WindowsServiceException::WindowsServiceException(std::string operation, unsigned long errorCode)
-    : std::runtime_error(operation + " failed: " + FormatWin32Message(errorCode) + " (" + std::to_string(errorCode) + ")"),
+    : std::runtime_error(operation + " failed: " + FormatWin32Error(errorCode)),
       operation_(std::move(operation)),
       errorCode_(errorCode) {
 }
@@ -4104,13 +6904,65 @@ const ClaimsPrincipal& AuthenticationResult::Principal() const noexcept { return
 const std::string& AuthenticationResult::Failure() const noexcept { return failure_; }
 const std::string& AuthenticationResult::Challenge() const noexcept { return challenge_; }
 
+AuthorizationPolicy& AuthorizationPolicy::RequireRole(std::string role) {
+    role = Trim(std::move(role));
+    if (role.empty()) {
+        throw std::invalid_argument("AuthorizationPolicy::RequireRole role cannot be empty.");
+    }
+    ValidateHeaderValue(role, "AuthorizationPolicy::RequireRole role");
+    if (std::none_of(RequiredRoles.begin(), RequiredRoles.end(), [&](const std::string& current) {
+            return EqualsIgnoreCase(current, role);
+        })) {
+        RequiredRoles.push_back(std::move(role));
+    }
+    return *this;
+}
+
+AuthorizationPolicy& AuthorizationPolicy::RequireRoles(std::initializer_list<std::string> roles) {
+    for (const std::string& role : roles) {
+        RequireRole(role);
+    }
+    return *this;
+}
+
+AuthorizationPolicy& AuthorizationPolicy::RequireRoles(std::vector<std::string> roles) {
+    for (std::string& role : roles) {
+        RequireRole(std::move(role));
+    }
+    return *this;
+}
+
+AuthorizationPolicy& AuthorizationPolicy::RequireClaim(std::string type) {
+    return RequireClaim(std::move(type), {});
+}
+
+AuthorizationPolicy& AuthorizationPolicy::RequireClaim(std::string type, std::string value) {
+    type = Trim(std::move(type));
+    if (type.empty()) {
+        throw std::invalid_argument("AuthorizationPolicy::RequireClaim type cannot be empty.");
+    }
+    ValidateHeaderValue(type, "AuthorizationPolicy::RequireClaim type");
+    ValidateHeaderValue(value, "AuthorizationPolicy::RequireClaim value");
+    bool exists = std::any_of(RequiredClaims.begin(), RequiredClaims.end(), [&](const AuthorizationClaimRequirement& current) {
+        return EqualsIgnoreCase(current.Type, type) && EqualsIgnoreCase(current.Value, value);
+    });
+    if (!exists) {
+        RequiredClaims.push_back({ std::move(type), std::move(value) });
+    }
+    return *this;
+}
+
 void HeaderCollection::Add(std::string name, std::string value) {
+    ValidateHeaderName(name, "HTTP header name");
+    ValidateHeaderValue(value, "HTTP header value");
     entries_.emplace_back(std::move(name), std::move(value));
 }
 
 void HeaderCollection::Set(std::string name, std::string value) {
+    ValidateHeaderName(name, "HTTP header name");
+    ValidateHeaderValue(value, "HTTP header value");
     Remove(name);
-    Add(std::move(name), std::move(value));
+    entries_.emplace_back(std::move(name), std::move(value));
 }
 
 bool HeaderCollection::Remove(std::string_view name) {
@@ -4167,7 +7019,114 @@ const std::string& HttpRequest::Scheme() const noexcept { return scheme_; }
 const std::string& HttpRequest::Host() const noexcept { return host_; }
 const HeaderCollection& HttpRequest::Headers() const noexcept { return headers_; }
 const ValueMap& HttpRequest::Query() const noexcept { return query_; }
+const ValueListMap& HttpRequest::QueryValues() const noexcept { return queryValues_; }
 const ValueMap& HttpRequest::RouteValues() const noexcept { return routeValues_; }
+const ValueMap& HttpRequest::Cookies() const {
+    if (!cookies_) {
+        cookies_ = ParseCookieHeaderValues(headers_.GetValues("Cookie"));
+    }
+    return *cookies_;
+}
+
+const ValueMap& HttpRequest::Form() const {
+    if (!form_) {
+        if (HasMultipartFormDataContentType()) {
+            MultipartFormData multipart = ParseMultipartFormData(Header("Content-Type"), body_, formOptions_);
+            form_ = std::move(multipart.Fields);
+            formValues_ = std::move(multipart.FieldValues);
+            files_ = std::move(multipart.Files);
+        } else {
+            ParsedValueCollection parsed = ParseFormUrlEncoded(body_, formOptions_);
+            form_ = std::move(parsed.Values);
+            formValues_ = std::move(parsed.ValueLists);
+            if (!files_) {
+                files_.emplace();
+            }
+        }
+    }
+    return *form_;
+}
+
+const ValueListMap& HttpRequest::FormValues() const {
+    if (!formValues_) {
+        (void)Form();
+    }
+    return *formValues_;
+}
+
+const std::vector<MultipartFile>& HttpRequest::Files() const {
+    if (!files_) {
+        if (HasMultipartFormDataContentType()) {
+            MultipartFormData multipart = ParseMultipartFormData(Header("Content-Type"), body_, formOptions_);
+            form_ = std::move(multipart.Fields);
+            formValues_ = std::move(multipart.FieldValues);
+            files_ = std::move(multipart.Files);
+        } else {
+            files_.emplace();
+        }
+    }
+    return *files_;
+}
+
+const MultipartFile* HttpRequest::File(std::string_view name) const {
+    const auto& files = Files();
+    for (const MultipartFile& file : files) {
+        if (file.Name == name) {
+            return &file;
+        }
+    }
+    return nullptr;
+}
+
+HttpRequest& HttpRequest::Method(std::string method) {
+    method = ToUpperAscii(Trim(std::move(method)));
+    if (method.empty()) {
+        throw std::invalid_argument("Request method cannot be empty.");
+    }
+    for (unsigned char ch : method) {
+        bool valid = std::isupper(ch) != 0 || std::isdigit(ch) != 0 || ch == '!' || ch == '#' ||
+            ch == '$' || ch == '%' || ch == '&' || ch == '\'' || ch == '*' || ch == '+' ||
+            ch == '-' || ch == '.' || ch == '^' || ch == '_' || ch == '`' || ch == '|' || ch == '~';
+        if (!valid) {
+            throw std::invalid_argument("Request method contains invalid characters.");
+        }
+    }
+    method_ = std::move(method);
+    return *this;
+}
+
+HttpRequest& HttpRequest::Path(std::string path) {
+    path_ = NormalizeRoutePath(std::move(path));
+    routeValues_.clear();
+    rawUrl_ = path_;
+    if (!queryString_.empty()) {
+        rawUrl_ += queryString_.front() == '?' ? queryString_ : "?" + queryString_;
+    }
+    return *this;
+}
+
+HttpRequest& HttpRequest::QueryString(std::string queryString) {
+    queryString = Trim(std::move(queryString));
+    if (!queryString.empty() && queryString.front() != '?') {
+        queryString.insert(queryString.begin(), '?');
+    }
+    queryString_ = std::move(queryString);
+    ParsedValueCollection parsed = ParseUrlEncodedValues(queryString_);
+    query_ = std::move(parsed.Values);
+    queryValues_ = std::move(parsed.ValueLists);
+    rawUrl_ = path_.empty() ? "/" : path_;
+    rawUrl_ += queryString_;
+    return *this;
+}
+
+HttpRequest& HttpRequest::Body(std::string body) {
+    body_ = std::move(body);
+    jsonDocument_.reset();
+    form_.reset();
+    formValues_.reset();
+    files_.reset();
+    return *this;
+}
 
 HttpRequest& HttpRequest::RemoteAddress(std::string remoteAddress) {
     remoteAddress_ = Trim(std::move(remoteAddress));
@@ -4195,7 +7154,46 @@ HttpRequest& HttpRequest::Host(std::string host) {
 
 HttpRequest& HttpRequest::Header(std::string name, std::string value) {
     ValidateHeaderName(name, "HttpRequest::Header name");
+    bool isCookie = EqualsIgnoreCase(name, "Cookie");
+    bool isContentType = EqualsIgnoreCase(name, "Content-Type");
     headers_.Set(std::move(name), std::move(value));
+    if (isCookie) {
+        cookies_.reset();
+    }
+    if (isContentType) {
+        form_.reset();
+        formValues_.reset();
+        files_.reset();
+    }
+    return *this;
+}
+
+HttpRequest& HttpRequest::AddHeader(std::string name, std::string value) {
+    ValidateHeaderName(name, "HttpRequest::AddHeader name");
+    bool isCookie = EqualsIgnoreCase(name, "Cookie");
+    bool isContentType = EqualsIgnoreCase(name, "Content-Type");
+    headers_.Add(std::move(name), std::move(value));
+    if (isCookie) {
+        cookies_.reset();
+    }
+    if (isContentType) {
+        form_.reset();
+        formValues_.reset();
+        files_.reset();
+    }
+    return *this;
+}
+
+HttpRequest& HttpRequest::RemoveHeader(std::string_view name) {
+    if (EqualsIgnoreCase(name, "Cookie")) {
+        cookies_.reset();
+    }
+    if (EqualsIgnoreCase(name, "Content-Type")) {
+        form_.reset();
+        formValues_.reset();
+        files_.reset();
+    }
+    headers_.Remove(name);
     return *this;
 }
 
@@ -4203,9 +7201,32 @@ std::string HttpRequest::Header(std::string_view name, std::string defaultValue)
     return headers_.Get(name, std::move(defaultValue));
 }
 
+std::string HttpRequest::Cookie(std::string_view name, std::string defaultValue) const {
+    const ValueMap& cookies = Cookies();
+    auto it = cookies.find(std::string(name));
+    return it == cookies.end() ? std::move(defaultValue) : it->second;
+}
+
+std::string HttpRequest::FormValue(std::string_view name, std::string defaultValue) const {
+    const ValueMap& form = Form();
+    auto it = form.find(std::string(name));
+    return it == form.end() ? std::move(defaultValue) : it->second;
+}
+
+std::vector<std::string> HttpRequest::FormValues(std::string_view name) const {
+    const ValueListMap& values = FormValues();
+    auto it = values.find(std::string(name));
+    return it == values.end() ? std::vector<std::string>() : it->second;
+}
+
 std::string HttpRequest::QueryValue(std::string_view name, std::string defaultValue) const {
     auto it = query_.find(std::string(name));
     return it == query_.end() ? std::move(defaultValue) : it->second;
+}
+
+std::vector<std::string> HttpRequest::QueryValues(std::string_view name) const {
+    auto it = queryValues_.find(std::string(name));
+    return it == queryValues_.end() ? std::vector<std::string>() : it->second;
 }
 
 std::string HttpRequest::RouteValue(std::string_view name, std::string defaultValue) const {
@@ -4223,9 +7244,21 @@ std::string HttpRequest::Value(std::string_view name, std::string defaultValue) 
 }
 
 bool HttpRequest::HasJsonContentType() const {
-    std::string contentType = ToLowerAscii(Header("Content-Type"));
-    return contentType.find("application/json") != std::string::npos ||
-        contentType.find("+json") != std::string::npos;
+    std::string mediaType = MediaTypeFromContentType(Header("Content-Type"));
+    return mediaType == "application/json" ||
+        (mediaType.size() > 5 && mediaType.ends_with("+json"));
+}
+
+bool HttpRequest::HasFormUrlEncodedContentType() const {
+    return MediaTypeFromContentType(Header("Content-Type")) == "application/x-www-form-urlencoded";
+}
+
+bool HttpRequest::HasMultipartFormDataContentType() const {
+    return MediaTypeFromContentType(Header("Content-Type")) == "multipart/form-data";
+}
+
+bool HttpRequest::HasFormContentType() const {
+    return HasFormUrlEncodedContentType() || HasMultipartFormDataContentType();
 }
 
 System::Text::Json::JsonElement HttpRequest::Json() const {
@@ -4238,6 +7271,7 @@ System::Text::Json::JsonElement HttpRequest::Json() const {
 int HttpResponse::StatusCode() const noexcept { return statusCode_; }
 
 HttpResponse& HttpResponse::Status(int statusCode) {
+    ValidateHttpStatusCode(statusCode, "HttpResponse::Status");
     statusCode_ = statusCode;
     return *this;
 }
@@ -4284,6 +7318,15 @@ HttpResponse& HttpResponse::ClearBody() {
     return *this;
 }
 
+HttpResponse& HttpResponse::AppendCookie(std::string name, std::string value, CookieOptions options) {
+    headers_.Add("Set-Cookie", SerializeSetCookieHeader(std::move(name), std::move(value), options));
+    return *this;
+}
+
+HttpResponse& HttpResponse::DeleteCookie(std::string name, CookieOptions options) {
+    return AppendCookie(std::move(name), {}, ExpiredCookieOptions(std::move(options)));
+}
+
 HttpRequest& HttpContext::Request() noexcept { return request_; }
 const HttpRequest& HttpContext::Request() const noexcept { return request_; }
 HttpResponse& HttpContext::Response() noexcept { return response_; }
@@ -4293,6 +7336,9 @@ HttpContext& HttpContext::TraceIdentifier(std::string traceIdentifier) {
     traceIdentifier = Trim(std::move(traceIdentifier));
     if (traceIdentifier.empty()) {
         throw std::invalid_argument("TraceIdentifier cannot be empty.");
+    }
+    if (ContainsUnsafeHeaderValueCharacters(traceIdentifier)) {
+        throw std::invalid_argument("TraceIdentifier cannot contain CR/LF or other control characters.");
     }
     traceIdentifier_ = std::move(traceIdentifier);
     return *this;
@@ -4304,6 +7350,17 @@ const ClaimsPrincipal& HttpContext::User() const noexcept { return user_; }
 HttpContext& HttpContext::User(ClaimsPrincipal user) {
     user_ = std::move(user);
     return *this;
+}
+const std::optional<EndpointMatch>& HttpContext::MatchedEndpoint() const noexcept { return matchedEndpoint_; }
+std::string HttpContext::EndpointName(std::string defaultValue) const {
+    return matchedEndpoint_ && !matchedEndpoint_->Name.empty()
+        ? matchedEndpoint_->Name
+        : std::move(defaultValue);
+}
+std::string HttpContext::EndpointPattern(std::string defaultValue) const {
+    return matchedEndpoint_ && !matchedEndpoint_->Pattern.empty()
+        ? matchedEndpoint_->Pattern
+        : std::move(defaultValue);
 }
 
 bool HttpResult::HasResponse() const noexcept { return hasResponse_; }
@@ -4318,6 +7375,16 @@ HttpResult& HttpResult::Header(std::string name, std::string value) {
     return *this;
 }
 
+HttpResult& HttpResult::AppendCookie(std::string name, std::string value, CookieOptions options) {
+    hasResponse_ = true;
+    headers_.Add("Set-Cookie", SerializeSetCookieHeader(std::move(name), std::move(value), options));
+    return *this;
+}
+
+HttpResult& HttpResult::DeleteCookie(std::string name, CookieOptions options) {
+    return AppendCookie(std::move(name), {}, ExpiredCookieOptions(std::move(options)));
+}
+
 HttpResult& HttpResult::WriteBytes(std::vector<std::uint8_t> bytes) {
     hasResponse_ = true;
     body_ = std::move(bytes);
@@ -4330,12 +7397,17 @@ void HttpResult::Apply(HttpResponse& response) const {
     }
     response.Status(statusCode_);
     for (const auto& [name, value] : headers_.Items()) {
-        response.Headers().Set(name, value);
+        if (EqualsIgnoreCase(name, "Set-Cookie")) {
+            response.Headers().Add(name, value);
+        } else {
+            response.Headers().Set(name, value);
+        }
     }
     response.WriteBytes(body_);
 }
 
 HttpResult HttpResult::Create(int statusCode, std::string contentType, std::vector<std::uint8_t> body) {
+    ValidateHttpStatusCode(statusCode, "HttpResult::StatusCode");
     HttpResult result;
     result.hasResponse_ = true;
     result.statusCode_ = statusCode;
@@ -4377,6 +7449,13 @@ HttpResult Results::File(std::vector<std::uint8_t> bytes, std::string contentTyp
         result.headers_.Set("Content-Disposition", "attachment; filename=\"" + EscapeQuotedHeaderValue(downloadName) + "\"");
     }
     return result;
+}
+
+HttpResult Results::File(const std::filesystem::path& path, std::string contentType, std::string downloadName) {
+    if (contentType.empty()) {
+        contentType = ContentTypeForExtension(path);
+    }
+    return File(ReadFileBytes(path), std::move(contentType), std::move(downloadName));
 }
 
 HttpResult Results::Json(const System::Text::Json::JsonElement& value, int statusCode) {
@@ -4423,9 +7502,51 @@ HttpResult Results::Ok(const System::Text::Json::JsonNode& value) {
     return Json(value);
 }
 
+HttpResult Results::Created(std::string location) {
+    HttpResult result = StatusCode(201);
+    if (!location.empty()) {
+        result.headers_.Set("Location", std::move(location));
+    }
+    return result;
+}
+
+HttpResult Results::Created(std::string location, const System::Text::Json::JsonElement& value) {
+    HttpResult result = Json(value, 201);
+    if (!location.empty()) {
+        result.headers_.Set("Location", std::move(location));
+    }
+    return result;
+}
+
 HttpResult Results::Created(std::string location, const System::Text::Json::JsonNode& value) {
     HttpResult result = Json(value, 201);
-    result.headers_.Set("Location", std::move(location));
+    if (!location.empty()) {
+        result.headers_.Set("Location", std::move(location));
+    }
+    return result;
+}
+
+HttpResult Results::Accepted(std::string location) {
+    HttpResult result = StatusCode(202);
+    if (!location.empty()) {
+        result.headers_.Set("Location", std::move(location));
+    }
+    return result;
+}
+
+HttpResult Results::Accepted(std::string location, const System::Text::Json::JsonElement& value) {
+    HttpResult result = Json(value, 202);
+    if (!location.empty()) {
+        result.headers_.Set("Location", std::move(location));
+    }
+    return result;
+}
+
+HttpResult Results::Accepted(std::string location, const System::Text::Json::JsonNode& value) {
+    HttpResult result = Json(value, 202);
+    if (!location.empty()) {
+        result.headers_.Set("Location", std::move(location));
+    }
     return result;
 }
 
@@ -4447,6 +7568,10 @@ HttpResult Results::Forbidden(std::string detail) {
 
 HttpResult Results::NotFound(std::string detail) {
     return Problem("Not Found", std::move(detail), 404);
+}
+
+HttpResult Results::Conflict(std::string detail) {
+    return Problem("Conflict", std::move(detail), 409);
 }
 
 HttpResult Results::TooManyRequests(std::string detail) {
@@ -4567,6 +7692,194 @@ void SslBindingManager::Remove(const SslCertificateBinding& binding, bool ignore
     DeleteSslBinding(binding, ignoreMissing);
 }
 
+std::uint16_t ParseUrlPrefixPort(std::string_view portText, std::string_view optionName) {
+    if (portText.empty() || !std::all_of(portText.begin(), portText.end(), [](unsigned char ch) { return std::isdigit(ch) != 0; })) {
+        throw std::invalid_argument(std::string(optionName) + " must include a numeric TCP port.");
+    }
+    unsigned long value = std::stoul(std::string(portText));
+    if (value == 0 || value > std::numeric_limits<std::uint16_t>::max()) {
+        throw std::out_of_range(std::string(optionName) + " port must be between 1 and 65535.");
+    }
+    return static_cast<std::uint16_t>(value);
+}
+
+void ValidateUrlPrefix(std::string prefix, std::string_view optionName) {
+    prefix = NormalizeUrlPrefix(std::move(prefix));
+    if (prefix.find_first_of("\r\n\t") != std::string::npos) {
+        throw std::invalid_argument(std::string(optionName) + " cannot contain control characters.");
+    }
+
+    std::string lower = ToLowerAscii(prefix);
+    std::size_t schemeEnd = lower.find("://");
+    if (schemeEnd == std::string::npos) {
+        throw std::invalid_argument(std::string(optionName) + " must include http:// or https://.");
+    }
+
+    std::string scheme = lower.substr(0, schemeEnd);
+    if (scheme != "http" && scheme != "https") {
+        throw std::invalid_argument(std::string(optionName) + " scheme must be http or https.");
+    }
+
+    std::size_t authorityStart = schemeEnd + 3;
+    std::size_t pathStart = prefix.find('/', authorityStart);
+    if (pathStart == std::string::npos || pathStart == authorityStart) {
+        throw std::invalid_argument(std::string(optionName) + " must include a host, port, and path.");
+    }
+    if (prefix.find('?', pathStart) != std::string::npos || prefix.find('#', pathStart) != std::string::npos) {
+        throw std::invalid_argument(std::string(optionName) + " cannot include a query string or fragment.");
+    }
+
+    std::string authority = prefix.substr(authorityStart, pathStart - authorityStart);
+    std::string host;
+    std::string portText;
+    if (!authority.empty() && authority.front() == '[') {
+        std::size_t close = authority.find(']');
+        if (close == std::string::npos || close + 1 >= authority.size() || authority[close + 1] != ':') {
+            throw std::invalid_argument(std::string(optionName) + " IPv6 hosts must use [address]:port.");
+        }
+        host = authority.substr(1, close - 1);
+        portText = authority.substr(close + 2);
+    } else {
+        std::size_t colon = authority.rfind(':');
+        if (colon == std::string::npos) {
+            throw std::invalid_argument(std::string(optionName) + " must include an explicit port.");
+        }
+        host = authority.substr(0, colon);
+        portText = authority.substr(colon + 1);
+    }
+
+    if (Trim(host).empty()) {
+        throw std::invalid_argument(std::string(optionName) + " host cannot be empty.");
+    }
+    (void)ParseUrlPrefixPort(portText, optionName);
+}
+
+void ValidateHttpSysTimeouts(const HttpSysTimeoutOptions& options) {
+    auto requireNonNegative = [](std::chrono::seconds value, std::string_view name) {
+        if (value.count() < 0) {
+            throw std::out_of_range(std::string(name) + " cannot be negative.");
+        }
+    };
+    requireNonNegative(options.EntityBody, "HttpSysTimeoutOptions::EntityBody");
+    requireNonNegative(options.DrainEntityBody, "HttpSysTimeoutOptions::DrainEntityBody");
+    requireNonNegative(options.RequestQueue, "HttpSysTimeoutOptions::RequestQueue");
+    requireNonNegative(options.IdleConnection, "HttpSysTimeoutOptions::IdleConnection");
+    requireNonNegative(options.HeaderWait, "HttpSysTimeoutOptions::HeaderWait");
+}
+
+void ValidateHttpSysBackpressureOptions(const HttpSysBackpressureOptions& options) {
+    ValidateHttpStatusCode(options.StoppingStatusCode, "HttpSysBackpressureOptions::StoppingStatusCode");
+    ValidateHttpStatusCode(options.OverloadedStatusCode, "HttpSysBackpressureOptions::OverloadedStatusCode");
+    if (options.StoppingStatusCode < 400) {
+        throw std::out_of_range("HttpSysBackpressureOptions::StoppingStatusCode must be a client or server error status.");
+    }
+    if (options.OverloadedStatusCode < 400) {
+        throw std::out_of_range("HttpSysBackpressureOptions::OverloadedStatusCode must be a client or server error status.");
+    }
+    if (options.StoppingRetryAfterSeconds < 0) {
+        throw std::out_of_range("HttpSysBackpressureOptions::StoppingRetryAfterSeconds cannot be negative.");
+    }
+    if (options.OverloadedRetryAfterSeconds < 0) {
+        throw std::out_of_range("HttpSysBackpressureOptions::OverloadedRetryAfterSeconds cannot be negative.");
+    }
+    ValidateHeaderValue(options.StoppingDetail, "HttpSysBackpressureOptions::StoppingDetail");
+    ValidateHeaderValue(options.OverloadedDetail, "HttpSysBackpressureOptions::OverloadedDetail");
+}
+
+void ValidateSslCertificateBinding(const SslCertificateBinding& binding, std::string_view optionName) {
+    if (binding.Mode == MachineConfigMode::Disabled) {
+        return;
+    }
+    if (binding.Port == 0) {
+        throw std::invalid_argument(std::string(optionName) + " port cannot be 0.");
+    }
+    (void)BuildSslSocketAddress(binding);
+    if (binding.Mode == MachineConfigMode::Ensure || binding.Mode == MachineConfigMode::Refresh) {
+        (void)ParseHexBytes(binding.CertificateHashHex);
+        (void)ParseGuid(binding.AppId);
+    }
+}
+
+std::string SslCertificateBindingEndpointKey(const SslCertificateBinding& binding) {
+    return ToLowerAscii(binding.Ip) + ":" + std::to_string(binding.Port);
+}
+
+bool IsMachineConfigCreateOrRefreshMode(MachineConfigMode mode) noexcept {
+    return mode == MachineConfigMode::Ensure || mode == MachineConfigMode::Refresh;
+}
+
+void ValidateMachineConfigDeletePlan(const HttpSysOptions& options) {
+    bool hasDelete = options.UrlReservation.Mode == UrlAclMode::Delete;
+    bool hasCreateOrRefresh = IsMachineConfigCreateOrRefreshMode(options.UrlReservation.Mode);
+
+    for (const SslCertificateBinding& binding : options.SslCertificateBindings) {
+        hasDelete = hasDelete || binding.Mode == MachineConfigMode::Delete;
+        hasCreateOrRefresh = hasCreateOrRefresh || IsMachineConfigCreateOrRefreshMode(binding.Mode);
+    }
+
+    if (hasDelete && hasCreateOrRefresh) {
+        throw std::invalid_argument(
+            "HTTP.sys machine configuration Delete mode cannot be combined with Ensure or Refresh operations.");
+    }
+}
+
+void ValidateHttpSysOptions(const HttpSysOptions& options) {
+    if (options.UrlPrefixes.empty()) {
+        throw std::invalid_argument("HttpSysOptions::UrlPrefixes must contain at least one URL prefix.");
+    }
+
+    std::vector<std::string> normalizedPrefixes;
+    normalizedPrefixes.reserve(options.UrlPrefixes.size());
+    for (std::size_t index = 0; index < options.UrlPrefixes.size(); ++index) {
+        std::string optionName = "HttpSysOptions::UrlPrefixes[" + std::to_string(index) + "]";
+        ValidateUrlPrefix(options.UrlPrefixes[index], optionName);
+        std::string normalized = ToLowerAscii(NormalizeUrlPrefix(options.UrlPrefixes[index]));
+        if (ContainsTokenIgnoreCase(normalizedPrefixes, normalized)) {
+            throw std::invalid_argument("HttpSysOptions::UrlPrefixes contains a duplicate URL prefix: " + NormalizeUrlPrefix(options.UrlPrefixes[index]));
+        }
+        normalizedPrefixes.push_back(std::move(normalized));
+    }
+
+    if (options.RequestBufferSize == 0) {
+        throw std::out_of_range("HttpSysOptions::RequestBufferSize must be greater than 0.");
+    }
+    if (options.StopTimeout.count() < 0) {
+        throw std::out_of_range("HttpSysOptions::StopTimeout cannot be negative.");
+    }
+    ValidateHttpSysTimeouts(options.Timeouts);
+    ValidateHttpSysBackpressureOptions(options.Backpressure);
+
+    if (options.AddServerHeader) {
+        if (Trim(options.ServerHeader).empty()) {
+            throw std::invalid_argument("HttpSysOptions::ServerHeader cannot be empty when AddServerHeader is true.");
+        }
+        if (ContainsUnsafeHeaderValueCharacters(options.ServerHeader)) {
+            throw std::invalid_argument("HttpSysOptions::ServerHeader cannot contain CR/LF.");
+        }
+    }
+
+    if ((options.UrlReservation.Mode == UrlAclMode::Ensure || options.UrlReservation.Mode == UrlAclMode::Refresh) &&
+        options.UrlReservation.SecurityDescriptor.empty()) {
+        throw std::invalid_argument("UrlReservationOptions::SecurityDescriptor cannot be empty for Ensure or Refresh.");
+    }
+    ValidateMachineConfigDeletePlan(options);
+
+    std::vector<std::string> sslBindingEndpoints;
+    for (std::size_t index = 0; index < options.SslCertificateBindings.size(); ++index) {
+        ValidateSslCertificateBinding(
+            options.SslCertificateBindings[index],
+            "HttpSysOptions::SslCertificateBindings[" + std::to_string(index) + "]");
+        if (options.SslCertificateBindings[index].Mode == MachineConfigMode::Disabled) {
+            continue;
+        }
+        std::string endpointKey = SslCertificateBindingEndpointKey(options.SslCertificateBindings[index]);
+        if (ContainsTokenIgnoreCase(sslBindingEndpoints, endpointKey)) {
+            throw std::invalid_argument("HttpSysOptions::SslCertificateBindings contains a duplicate IP:port binding: " + endpointKey);
+        }
+        sslBindingEndpoints.push_back(std::move(endpointKey));
+    }
+}
+
 WebApplicationBuilder::WebApplicationBuilder() = default;
 
 WebApplicationBuilder::WebApplicationBuilder(WebApplicationOptions options)
@@ -4617,12 +7930,26 @@ WebApplicationBuilder& WebApplicationBuilder::ConfigureFromEnvironment(std::stri
 }
 
 WebApplicationBuilder& WebApplicationBuilder::ConfigureHttpSys(std::function<void(HttpSysOptions&)> configure) {
+    if (!configure) {
+        throw std::invalid_argument("ConfigureHttpSys callback cannot be empty.");
+    }
     configure(options_.HttpSys);
     return *this;
 }
 
 WebApplicationBuilder& WebApplicationBuilder::ConfigureProblemDetails(std::function<void(ProblemDetailsOptions&)> configure) {
+    if (!configure) {
+        throw std::invalid_argument("ConfigureProblemDetails callback cannot be empty.");
+    }
     configure(options_.ProblemDetails);
+    return *this;
+}
+
+WebApplicationBuilder& WebApplicationBuilder::ConfigureFormOptions(std::function<void(FormOptions&)> configure) {
+    if (!configure) {
+        throw std::invalid_argument("ConfigureFormOptions callback cannot be empty.");
+    }
+    configure(options_.Forms);
     return *this;
 }
 
@@ -4666,6 +7993,180 @@ const WebApplicationOptions& WebApplicationBuilder::Options() const noexcept {
     return options_;
 }
 
+RouteGroupBuilder::RouteGroupBuilder(WebApplication& app, std::string prefix)
+    : app_(&app), prefix_(NormalizeEndpointRoutePattern(std::move(prefix), "Route group prefix")) {
+}
+
+const std::string& RouteGroupBuilder::Prefix() const noexcept {
+    return prefix_;
+}
+
+RouteGroupBuilder RouteGroupBuilder::MapGroup(std::string prefix) const {
+    App().EnsureCanConfigure("RouteGroupBuilder::MapGroup");
+    RouteGroupBuilder group(App(), FullPattern(std::move(prefix)));
+    group.requireAuthorization_ = requireAuthorization_;
+    group.allowAnonymous_ = allowAnonymous_;
+    group.authorizationPolicies_ = authorizationPolicies_;
+    group.authorizationRequirements_ = authorizationRequirements_;
+    group.inheritedAuthorizationRequirementCount_ = group.authorizationRequirements_.size();
+    group.endpointFilters_ = endpointFilters_;
+    group.tags_ = tags_;
+    return group;
+}
+
+RouteGroupBuilder& RouteGroupBuilder::RequireAuthorization(std::string policy) {
+    App().EnsureCanConfigure("RouteGroupBuilder::RequireAuthorization");
+    policy = Trim(std::move(policy));
+    if (policy.empty()) {
+        requireAuthorization_ = true;
+        allowAnonymous_ = false;
+        return *this;
+    }
+    return RequireAuthorization({ policy });
+}
+
+RouteGroupBuilder& RouteGroupBuilder::RequireAuthorization(std::initializer_list<std::string> policies) {
+    App().EnsureCanConfigure("RouteGroupBuilder::RequireAuthorization");
+    requireAuthorization_ = true;
+    allowAnonymous_ = false;
+    for (std::string policy : policies) {
+        policy = Trim(std::move(policy));
+        if (!policy.empty() && !ContainsTokenIgnoreCase(authorizationPolicies_, policy)) {
+            authorizationPolicies_.push_back(std::move(policy));
+        }
+    }
+    return *this;
+}
+
+RouteGroupBuilder& RouteGroupBuilder::RequireAuthorization(AuthorizationPolicy policy) {
+    App().EnsureCanConfigure("RouteGroupBuilder::RequireAuthorization");
+    ValidateAuthorizationPolicyFields(policy, "Route group authorization policy");
+    requireAuthorization_ = true;
+    allowAnonymous_ = false;
+    authorizationRequirements_.push_back(std::move(policy));
+    return *this;
+}
+
+AuthorizationPolicy& RouteGroupBuilder::LocalAuthorizationRequirement() {
+    App().EnsureCanConfigure("RouteGroupBuilder authorization requirements");
+    requireAuthorization_ = true;
+    allowAnonymous_ = false;
+    if (authorizationRequirements_.size() == inheritedAuthorizationRequirementCount_) {
+        authorizationRequirements_.emplace_back();
+    }
+    return authorizationRequirements_.back();
+}
+
+RouteGroupBuilder& RouteGroupBuilder::RequireRole(std::string role) {
+    LocalAuthorizationRequirement().RequireRole(std::move(role));
+    return *this;
+}
+
+RouteGroupBuilder& RouteGroupBuilder::RequireRoles(std::initializer_list<std::string> roles) {
+    LocalAuthorizationRequirement().RequireRoles(roles);
+    return *this;
+}
+
+RouteGroupBuilder& RouteGroupBuilder::RequireRoles(std::vector<std::string> roles) {
+    LocalAuthorizationRequirement().RequireRoles(std::move(roles));
+    return *this;
+}
+
+RouteGroupBuilder& RouteGroupBuilder::RequireClaim(std::string type) {
+    LocalAuthorizationRequirement().RequireClaim(std::move(type));
+    return *this;
+}
+
+RouteGroupBuilder& RouteGroupBuilder::RequireClaim(std::string type, std::string value) {
+    LocalAuthorizationRequirement().RequireClaim(std::move(type), std::move(value));
+    return *this;
+}
+
+RouteGroupBuilder& RouteGroupBuilder::AllowAnonymous() {
+    App().EnsureCanConfigure("RouteGroupBuilder::AllowAnonymous");
+    allowAnonymous_ = true;
+    return *this;
+}
+
+RouteGroupBuilder& RouteGroupBuilder::AddEndpointFilter(EndpointFilter filter) {
+    App().EnsureCanConfigure("RouteGroupBuilder::AddEndpointFilter");
+    if (!filter) {
+        throw std::invalid_argument("Endpoint filter cannot be empty.");
+    }
+    endpointFilters_.push_back(std::move(filter));
+    return *this;
+}
+
+RouteGroupBuilder& RouteGroupBuilder::WithTags(std::initializer_list<std::string> tags) {
+    return WithTags(std::vector<std::string>(tags.begin(), tags.end()));
+}
+
+RouteGroupBuilder& RouteGroupBuilder::WithTags(std::vector<std::string> tags) {
+    App().EnsureCanConfigure("RouteGroupBuilder::WithTags");
+    tags_.clear();
+    for (std::string& tag : tags) {
+        tag = Trim(std::move(tag));
+        if (!tag.empty()) {
+            ValidateHeaderValue(tag, "Route group tag");
+            tags_.push_back(std::move(tag));
+        }
+    }
+    return *this;
+}
+
+WebApplication& RouteGroupBuilder::MapMethods(std::initializer_list<std::string> methods, std::string pattern, EndpointHandler handler) {
+    return MapMethods(std::vector<std::string>(methods.begin(), methods.end()), std::move(pattern), std::move(handler));
+}
+
+WebApplication& RouteGroupBuilder::MapMethods(std::vector<std::string> methods, std::string pattern, EndpointHandler handler) {
+    App().EnsureCanConfigure("RouteGroupBuilder::MapMethods");
+    WebApplication& app = App();
+    return ApplyGroupMetadata(app.MapMethods(std::move(methods), FullPattern(std::move(pattern)), std::move(handler)));
+}
+
+WebApplication& RouteGroupBuilder::App() const {
+    if (app_ == nullptr) {
+        throw std::logic_error("RouteGroupBuilder is not associated with a WebApplication.");
+    }
+    return *app_;
+}
+
+std::string RouteGroupBuilder::FullPattern(std::string pattern) const {
+    std::string normalizedPattern = NormalizeEndpointRoutePattern(std::move(pattern), "Route pattern");
+    if (prefix_ == "/") {
+        return normalizedPattern;
+    }
+    if (normalizedPattern == "/") {
+        return prefix_;
+    }
+    return prefix_ + normalizedPattern;
+}
+
+WebApplication& RouteGroupBuilder::ApplyGroupMetadata(WebApplication& app) const {
+    if (!tags_.empty()) {
+        app.WithTags(tags_);
+    }
+    for (const EndpointFilter& filter : endpointFilters_) {
+        app.AddEndpointFilter(filter);
+    }
+    if (allowAnonymous_) {
+        app.AllowAnonymous();
+    } else if (requireAuthorization_) {
+        if (authorizationPolicies_.empty()) {
+            app.RequireAuthorization();
+        } else {
+            for (const std::string& policy : authorizationPolicies_) {
+                app.RequireAuthorization(policy);
+            }
+        }
+        for (const AuthorizationPolicy& policy : authorizationRequirements_) {
+            app.RequireAuthorization(policy);
+        }
+        app.MarkLastEndpointAuthorizationRequirementsAsGroup();
+    }
+    return app;
+}
+
 struct WebApplication::Impl {
     explicit Impl(WebApplicationOptions appOptions)
         : options(std::move(appOptions)) {
@@ -4674,7 +8175,7 @@ struct WebApplication::Impl {
     WebApplicationOptions options;
     std::vector<RouteEndpoint> endpoints;
     std::vector<Middleware> middlewares;
-    std::vector<std::pair<std::string, HealthCheck>> healthChecks;
+    std::vector<HealthCheckRegistration> healthChecks;
     std::shared_ptr<RequestMetricsStore> metrics = std::make_shared<RequestMetricsStore>();
     std::vector<ApplicationCallback> startedCallbacks;
     std::vector<ApplicationCallback> stoppingCallbacks;
@@ -4691,6 +8192,13 @@ struct WebApplication::Impl {
     std::condition_variable stopped;
     std::atomic<bool> running{ false };
     std::atomic<bool> stopping{ false };
+    std::atomic<bool> configurationLocked{ false };
+
+    void EnsureCanConfigure(std::string_view operation) const {
+        if (configurationLocked.load()) {
+            throw std::logic_error(std::string(operation) + " cannot be used after the application has started.");
+        }
+    }
 
     std::string HostedServiceName(std::size_t index) const {
         const std::string& name = hostedServices[index].Name;
@@ -4759,27 +8267,109 @@ struct WebApplication::Impl {
         return *endpoint;
     }
 
+    void ValidateEndpointDoesNotConflict(const RouteEndpoint& candidate) const {
+        for (const RouteEndpoint& existing : endpoints) {
+            if (EndpointRouteConflicts(existing, candidate)) {
+                throw std::invalid_argument(
+                    "Endpoint route '" + candidate.Pattern + "' with method(s) " +
+                    DescribeEndpointMethods(candidate.Methods) +
+                    " conflicts with an existing endpoint.");
+            }
+        }
+        if (fallback && EndpointRouteConflicts(*fallback, candidate)) {
+            throw std::invalid_argument(
+                "Endpoint route '" + candidate.Pattern + "' with method(s) " +
+                DescribeEndpointMethods(candidate.Methods) +
+                " conflicts with an existing fallback endpoint.");
+        }
+    }
+
+    void ValidateEndpointNameAvailable(const RouteEndpoint& target, const std::string& name) const {
+        if (name.empty()) {
+            return;
+        }
+        auto isSameEndpoint = [&target](const RouteEndpoint& endpoint) {
+            return &endpoint == &target;
+        };
+        for (const RouteEndpoint& endpoint : endpoints) {
+            if (!isSameEndpoint(endpoint) && EqualsIgnoreCase(endpoint.Name, name)) {
+                throw std::invalid_argument("Duplicate endpoint name: " + name);
+            }
+        }
+        if (fallback && !isSameEndpoint(*fallback) && EqualsIgnoreCase(fallback->Name, name)) {
+            throw std::invalid_argument("Duplicate endpoint name: " + name);
+        }
+    }
+
+    const RouteEndpoint* FindEndpointByName(std::string_view name) const {
+        for (const RouteEndpoint& endpoint : endpoints) {
+            if (EqualsIgnoreCase(endpoint.Name, name)) {
+                return &endpoint;
+            }
+        }
+        if (fallback && EqualsIgnoreCase(fallback->Name, name)) {
+            return &*fallback;
+        }
+        return nullptr;
+    }
+
     HttpResult InvokeEndpoint(const RouteEndpoint& endpoint, HttpContext& current) {
+        current.matchedEndpoint_ = CreateEndpointMatch(endpoint);
         AuthorizationOptions effectiveAuthorization = authorizationOptions;
         auto authorizationResult = TryAuthorizeEndpoint(endpoint, current, effectiveAuthorization);
         if (authorizationResult) {
             return *authorizationResult;
         }
-        return endpoint.Handler(current);
+        if (auto contentTypeFailure = ValidateEndpointContentType(endpoint, current.Request())) {
+            return CreateProblemResult(
+                current,
+                "Unsupported Media Type",
+                *contentTypeFailure,
+                415,
+                options.ProblemDetails,
+                &options.Log);
+        }
+        if (auto acceptFailure = ValidateEndpointAccept(endpoint, current.Request())) {
+            return CreateProblemResult(
+                current,
+                "Not Acceptable",
+                *acceptFailure,
+                406,
+                options.ProblemDetails,
+                &options.Log);
+        }
+        RequestDelegate invoke = [&endpoint](HttpContext& filtered) {
+            return endpoint.Handler(filtered);
+        };
+        for (auto it = endpoint.Filters.rbegin(); it != endpoint.Filters.rend(); ++it) {
+            EndpointFilter filter = *it;
+            RequestDelegate next = invoke;
+            invoke = [filter, next](HttpContext& filtered) {
+                return filter(filtered, next);
+            };
+        }
+        return invoke(current);
     }
 
     HttpResult Dispatch(HttpContext& context) {
         RequestDelegate terminal = [this](HttpContext& current) {
             std::vector<std::string> allowedMethods;
+            const RouteEndpoint* implicitHeadEndpoint = nullptr;
+            ValueMap implicitHeadRouteValues;
             for (const RouteEndpoint& endpoint : endpoints) {
                 ValueMap routeValues;
                 if (!MatchEndpointPath(endpoint, current.Request(), routeValues)) {
                     continue;
                 }
 
-                if (EndpointAllowsMethod(endpoint, current.Request().Method())) {
+                EndpointMethodMatch methodMatch = MatchEndpointMethod(endpoint, current.Request().Method());
+                if (methodMatch == EndpointMethodMatch::Exact) {
                     current.request_.routeValues_ = std::move(routeValues);
                     return InvokeEndpoint(endpoint, current);
+                }
+                if (methodMatch == EndpointMethodMatch::ImplicitHead && implicitHeadEndpoint == nullptr) {
+                    implicitHeadEndpoint = &endpoint;
+                    implicitHeadRouteValues = std::move(routeValues);
                 }
 
                 for (const std::string& method : endpoint.Methods) {
@@ -4790,6 +8380,10 @@ struct WebApplication::Impl {
                         allowedMethods.push_back("HEAD");
                     }
                 }
+            }
+            if (implicitHeadEndpoint != nullptr) {
+                current.request_.routeValues_ = std::move(implicitHeadRouteValues);
+                return InvokeEndpoint(*implicitHeadEndpoint, current);
             }
             if (fallback && EndpointAllowsMethod(*fallback, current.Request().Method())) {
                 return InvokeEndpoint(*fallback, current);
@@ -4920,6 +8514,80 @@ private:
 void ValidateServiceName(const std::wstring& serviceName) {
     if (serviceName.empty()) {
         throw std::invalid_argument("Windows service name cannot be empty.");
+    }
+    if (serviceName.size() > 256) {
+        throw std::invalid_argument("Windows service name cannot be longer than 256 characters.");
+    }
+    bool hasNonWhitespace = false;
+    for (wchar_t ch : serviceName) {
+        if (ch == L'/' || ch == L'\\') {
+            throw std::invalid_argument("Windows service name cannot contain slash characters.");
+        }
+        if (ch == L'\0' || (ch >= 0 && ch < 32) || ch == 127) {
+            throw std::invalid_argument("Windows service name cannot contain control characters.");
+        }
+        if (std::iswspace(ch) == 0) {
+            hasNonWhitespace = true;
+        }
+    }
+    if (!hasNonWhitespace) {
+        throw std::invalid_argument("Windows service name cannot be empty.");
+    }
+}
+
+void ValidateWindowsServiceText(const std::wstring& value, std::string_view optionName) {
+    if (value.find(L'\0') != std::wstring::npos) {
+        throw std::invalid_argument(std::string(optionName) + " cannot contain embedded NUL characters.");
+    }
+}
+
+void ValidateWindowsServiceStartMode(WindowsServiceStartMode startMode) {
+    switch (startMode) {
+    case WindowsServiceStartMode::Manual:
+    case WindowsServiceStartMode::Automatic:
+    case WindowsServiceStartMode::AutomaticDelayed:
+        return;
+    default:
+        throw std::invalid_argument("WindowsServiceOptions::StartMode is invalid.");
+    }
+}
+
+void ValidateWindowsServiceTimeout(std::chrono::seconds timeout, std::string_view optionName) {
+    if (timeout.count() < 0) {
+        throw std::out_of_range(std::string(optionName) + " cannot be negative.");
+    }
+}
+
+void ValidateWindowsServiceDependency(const std::wstring& dependency, std::size_t index) {
+    std::string optionName = "WindowsServiceOptions::Dependencies[" + std::to_string(index) + "]";
+    if (dependency.empty()) {
+        throw std::invalid_argument(optionName + " cannot be empty.");
+    }
+    if (dependency.front() == SC_GROUP_IDENTIFIER) {
+        if (dependency.size() == 1) {
+            throw std::invalid_argument(optionName + " group name cannot be empty.");
+        }
+        ValidateWindowsServiceText(dependency.substr(1), optionName);
+        return;
+    }
+    ValidateServiceName(dependency);
+}
+
+void ValidateWindowsServiceOptions(const WindowsServiceOptions& options) {
+    ValidateServiceName(options.ServiceName);
+    ValidateWindowsServiceText(options.DisplayName, "WindowsServiceOptions::DisplayName");
+    ValidateWindowsServiceText(options.Description, "WindowsServiceOptions::Description");
+    ValidateWindowsServiceText(options.AccountName, "WindowsServiceOptions::AccountName");
+    ValidateWindowsServiceText(options.Password, "WindowsServiceOptions::Password");
+    ValidateWindowsServiceStartMode(options.StartMode);
+    ValidateWindowsServiceTimeout(options.StopTimeout, "WindowsServiceOptions::StopTimeout");
+    for (std::size_t index = 0; index < options.Dependencies.size(); ++index) {
+        ValidateWindowsServiceDependency(options.Dependencies[index], index);
+    }
+    for (std::size_t index = 0; index < options.Arguments.size(); ++index) {
+        ValidateWindowsServiceText(
+            options.Arguments[index],
+            "WindowsServiceOptions::Arguments[" + std::to_string(index) + "]");
     }
 }
 
@@ -5241,7 +8909,7 @@ bool WindowsServiceHost::IsRunningAsService() {
 }
 
 int WindowsServiceHost::Run(WebApplication& app, WindowsServiceOptions options) {
-    ValidateServiceName(options.ServiceName);
+    ValidateWindowsServiceOptions(options);
     bool fallbackToConsole = options.FallbackToConsole;
     std::wstring serviceName = options.ServiceName;
 
@@ -5279,7 +8947,7 @@ int WindowsServiceHost::Run(WebApplication& app, WindowsServiceOptions options) 
 }
 
 void WindowsServiceHost::Install(const WindowsServiceOptions& options, const std::filesystem::path& executablePath) {
-    ValidateServiceName(options.ServiceName);
+    ValidateWindowsServiceOptions(options);
 
     std::filesystem::path resolvedExecutable = executablePath.empty()
         ? CurrentExecutablePath()
@@ -5342,6 +9010,7 @@ void WindowsServiceHost::Install(const WindowsServiceOptions& options, const std
 
 void WindowsServiceHost::Uninstall(std::wstring serviceName, std::chrono::seconds stopTimeout) {
     ValidateServiceName(serviceName);
+    ValidateWindowsServiceTimeout(stopTimeout, "WindowsServiceHost::Uninstall stopTimeout");
 
     ServiceHandle scm = OpenServiceControlManager(SC_MANAGER_CONNECT);
     ServiceHandle service(OpenServiceW(scm.Get(), serviceName.c_str(), DELETE | SERVICE_STOP | SERVICE_QUERY_STATUS));
@@ -5387,6 +9056,7 @@ void WindowsServiceHost::Start(std::wstring serviceName) {
 
 void WindowsServiceHost::Stop(std::wstring serviceName, std::chrono::seconds timeout) {
     ValidateServiceName(serviceName);
+    ValidateWindowsServiceTimeout(timeout, "WindowsServiceHost::Stop timeout");
 
     ServiceHandle scm = OpenServiceControlManager(SC_MANAGER_CONNECT);
     ServiceHandle service(OpenServiceW(scm.Get(), serviceName.c_str(), SERVICE_STOP | SERVICE_QUERY_STATUS));
@@ -5398,10 +9068,14 @@ void WindowsServiceHost::Stop(std::wstring serviceName, std::chrono::seconds tim
 
 WebApplication::WebApplication()
     : impl_(std::make_unique<Impl>(WebApplicationOptions{})) {
+    ValidateHttpSysOptions(impl_->options.HttpSys);
+    ValidateProblemDetailsOptions(impl_->options.ProblemDetails);
 }
 
 WebApplication::WebApplication(WebApplicationOptions options)
     : impl_(std::make_unique<Impl>(std::move(options))) {
+    ValidateHttpSysOptions(impl_->options.HttpSys);
+    ValidateProblemDetailsOptions(impl_->options.ProblemDetails);
 }
 
 WebApplication::~WebApplication() {
@@ -5434,7 +9108,18 @@ WebApplication WebApplication::Create(WebApplicationOptions options) {
     return WebApplication(std::move(options));
 }
 
+void WebApplication::EnsureCanConfigure(std::string_view operation) const {
+    if (!impl_) {
+        throw std::logic_error("Cannot configure a moved-from WebApplication.");
+    }
+    impl_->EnsureCanConfigure(operation);
+}
+
 WebApplication& WebApplication::Use(Middleware middleware) {
+    EnsureCanConfigure("Use");
+    if (!middleware) {
+        throw std::invalid_argument("Middleware cannot be empty.");
+    }
     impl_->middlewares.push_back(std::move(middleware));
     return *this;
 }
@@ -5444,6 +9129,8 @@ WebApplication& WebApplication::UseProblemDetails() {
 }
 
 WebApplication& WebApplication::UseProblemDetails(ProblemDetailsOptions options) {
+    EnsureCanConfigure("UseProblemDetails");
+    ValidateProblemDetailsOptions(options);
     impl_->options.ProblemDetails = options;
     impl_->middlewares.push_back([options = std::move(options)](HttpContext& context, RequestDelegate next) {
         return ApplyProblemDetails(context, next(context), options);
@@ -5452,6 +9139,8 @@ WebApplication& WebApplication::UseProblemDetails(ProblemDetailsOptions options)
 }
 
 WebApplication& WebApplication::UseStaticFiles(StaticFileOptions options) {
+    EnsureCanConfigure("UseStaticFiles");
+    ValidateStaticFileOptions(options);
     impl_->middlewares.push_back([options = std::move(options)](HttpContext& context, RequestDelegate next) {
         auto result = TryServeStaticFile(options, context);
         if (result) {
@@ -5462,7 +9151,62 @@ WebApplication& WebApplication::UseStaticFiles(StaticFileOptions options) {
     return *this;
 }
 
+WebApplication& WebApplication::UseRequestDecompression(RequestDecompressionOptions options) {
+    EnsureCanConfigure("UseRequestDecompression");
+    impl_->middlewares.push_back([this, options = std::move(options)](HttpContext& context, RequestDelegate next) {
+        if (!options.Enable || context.Request().Header("Content-Encoding").empty()) {
+            return next(context);
+        }
+
+        std::uint64_t maxBytes = options.MaxDecompressedBodyBytes != 0
+            ? options.MaxDecompressedBodyBytes
+            : impl_->options.HttpSys.MaxRequestBodyBytes;
+        RequestDecompressionResult decompressed = DecompressRequestBody(context.Request(), options, maxBytes);
+        if (decompressed.Status == RequestDecompressionStatus::UnsupportedEncoding) {
+            return CreateProblemResult(
+                context,
+                "Unsupported Media Type",
+                "Unsupported request Content-Encoding '" + decompressed.Encoding + "'. Supported content encodings: gzip, deflate.",
+                415,
+                impl_->options.ProblemDetails,
+                &impl_->options.Log);
+        }
+        if (decompressed.Status == RequestDecompressionStatus::InvalidBody) {
+            return CreateProblemResult(
+                context,
+                "Bad Request",
+                "Request body could not be decompressed as '" + decompressed.Encoding + "'.",
+                400,
+                impl_->options.ProblemDetails,
+                &impl_->options.Log);
+        }
+        if (decompressed.Status == RequestDecompressionStatus::TooLarge) {
+            return CreateProblemResult(
+                context,
+                "Payload Too Large",
+                "Decompressed request body exceeds the configured limit.",
+                413,
+                impl_->options.ProblemDetails,
+                &impl_->options.Log);
+        }
+
+        if (decompressed.Applied) {
+            context.Request().Body(BytesToString(decompressed.Body));
+            if (options.RemoveContentEncodingHeader) {
+                context.Request().RemoveHeader("Content-Encoding");
+            }
+            if (options.UpdateContentLengthHeader) {
+                context.Request().Header("Content-Length", std::to_string(context.Request().Body().size()));
+            }
+        }
+        return next(context);
+    });
+    return *this;
+}
+
 WebApplication& WebApplication::UseResponseCompression(ResponseCompressionOptions options) {
+    EnsureCanConfigure("UseResponseCompression");
+    ValidateResponseCompressionOptions(options);
     impl_->middlewares.push_back([options = std::move(options)](HttpContext& context, RequestDelegate next) {
         HttpResult result = next(context);
         if (result.HasResponse()) {
@@ -5475,7 +9219,22 @@ WebApplication& WebApplication::UseResponseCompression(ResponseCompressionOption
     return *this;
 }
 
+WebApplication& WebApplication::UseResponseCaching(ResponseCachingOptions options) {
+    EnsureCanConfigure("UseResponseCaching");
+    ValidateHeaderValue(options.CacheControl, "ResponseCachingOptions::CacheControl");
+    impl_->middlewares.push_back([options = std::move(options)](HttpContext& context, RequestDelegate next) {
+        HttpResult result = next(context);
+        if (result.HasResponse()) {
+            return ApplyResponseCaching(context.Request(), std::move(result), options);
+        }
+        ApplyResponseCaching(context, options);
+        return Results::Empty();
+    });
+    return *this;
+}
+
 WebApplication& WebApplication::UseAuthentication(AuthenticationOptions options) {
+    EnsureCanConfigure("UseAuthentication");
     ValidateAuthenticationOptions(options);
     impl_->middlewares.push_back([options = std::move(options)](HttpContext& context, RequestDelegate next) {
         AuthenticateRequest(context, options);
@@ -5485,6 +9244,7 @@ WebApplication& WebApplication::UseAuthentication(AuthenticationOptions options)
 }
 
 WebApplication& WebApplication::UseAuthorization(AuthorizationOptions options) {
+    EnsureCanConfigure("UseAuthorization");
     ValidateAuthorizationOptions(options);
     impl_->authorizationOptions = std::move(options);
     impl_->authorizationConfigured = true;
@@ -5492,7 +9252,9 @@ WebApplication& WebApplication::UseAuthorization(AuthorizationOptions options) {
 }
 
 WebApplication& WebApplication::UseCors(CorsOptions options) {
-    impl_->middlewares.push_back([options = std::move(options)](HttpContext& context, RequestDelegate next) {
+    EnsureCanConfigure("UseCors");
+    ValidateCorsOptions(options);
+    impl_->middlewares.push_back([this, options = std::move(options)](HttpContext& context, RequestDelegate next) {
         const HttpRequest& request = context.Request();
         if (request.Header("Origin").empty()) {
             return next(context);
@@ -5501,6 +9263,18 @@ WebApplication& WebApplication::UseCors(CorsOptions options) {
         bool isPreflight = EqualsIgnoreCase(request.Method(), "OPTIONS") &&
             !request.Header("Access-Control-Request-Method").empty();
         if (isPreflight) {
+            if (options.RejectInvalidPreflightRequests) {
+                auto failure = ValidateCorsPreflightRequest(options, request);
+                if (failure) {
+                    return CreateProblemResult(
+                        context,
+                        StatusReason(options.PreflightFailureStatusCode),
+                        std::move(*failure),
+                        options.PreflightFailureStatusCode,
+                        impl_->options.ProblemDetails,
+                        &impl_->options.Log);
+                }
+            }
             return CreateCorsPreflightResult(options, request);
         }
 
@@ -5513,6 +9287,8 @@ WebApplication& WebApplication::UseCors(CorsOptions options) {
 }
 
 WebApplication& WebApplication::UseSecurityHeaders(SecurityHeadersOptions options) {
+    EnsureCanConfigure("UseSecurityHeaders");
+    ValidateSecurityHeadersOptions(options);
     impl_->middlewares.push_back([options = std::move(options)](HttpContext& context, RequestDelegate next) {
         ApplySecurityHeaders(context.Response().Headers(), options);
         HttpResult result = next(context);
@@ -5522,16 +9298,70 @@ WebApplication& WebApplication::UseSecurityHeaders(SecurityHeadersOptions option
     return *this;
 }
 
+WebApplication& WebApplication::UseHsts(HstsOptions options) {
+    EnsureCanConfigure("UseHsts");
+    ValidateHstsOptions(options);
+    std::vector<HostFilterPattern> excludedHosts = BuildHostFilterPatterns(options.ExcludedHosts, "HstsOptions::ExcludedHosts");
+    impl_->middlewares.push_back([options = std::move(options), excludedHosts = std::move(excludedHosts)](HttpContext& context, RequestDelegate next) {
+        HttpResult result = next(context);
+        if (!options.Enable || !EqualsIgnoreCase(context.Request().Scheme(), "https")) {
+            return result;
+        }
+
+        std::string host = context.Request().Host().empty()
+            ? context.Request().Header("Host")
+            : context.Request().Host();
+        auto parsedHost = TryParseHostForFiltering(std::move(host));
+        if (parsedHost && IsHstsExcludedHost(*parsedHost, excludedHosts)) {
+            return result;
+        }
+
+        SetHeaderIfMissing(context.Response().Headers(), "Strict-Transport-Security", CreateStrictTransportSecurityValue(options));
+        if (result.HasResponse()) {
+            SetHeaderIfMissing(result.Headers(), "Strict-Transport-Security", CreateStrictTransportSecurityValue(options));
+        }
+        return result;
+    });
+    return *this;
+}
+
+WebApplication& WebApplication::UseHttpsRedirection(HttpsRedirectionOptions options) {
+    EnsureCanConfigure("UseHttpsRedirection");
+    ValidateHttpsRedirectionOptions(options);
+    impl_->middlewares.push_back([this, options = std::move(options)](HttpContext& context, RequestDelegate next) {
+        if (EqualsIgnoreCase(context.Request().Scheme(), "https")) {
+            return next(context);
+        }
+
+        std::string host = context.Request().Host().empty()
+            ? context.Request().Header("Host")
+            : context.Request().Host();
+        if (Trim(host).empty() && options.AllowEmptyHost) {
+            return next(context);
+        }
+
+        auto parsedHost = TryParseHostForFiltering(std::move(host));
+        if (!parsedHost) {
+            return CreateProblemResult(
+                context,
+                "Bad Request",
+                options.FailureDetail,
+                400,
+                impl_->options.ProblemDetails,
+                &impl_->options.Log);
+        }
+
+        std::string location = "https://" +
+            HostForHttpsRedirect(std::move(*parsedHost), options.HttpsPort) +
+            RequestTargetForRedirect(context.Request());
+        return Results::StatusCode(options.RedirectStatusCode).Header("Location", std::move(location));
+    });
+    return *this;
+}
+
 WebApplication& WebApplication::UseForwardedHeaders(ForwardedHeadersOptions options) {
-    if (options.ForwardedFor) {
-        ValidateHeaderName(options.ForwardedForHeaderName, "ForwardedHeadersOptions::ForwardedForHeaderName");
-    }
-    if (options.ForwardedProto) {
-        ValidateHeaderName(options.ForwardedProtoHeaderName, "ForwardedHeadersOptions::ForwardedProtoHeaderName");
-    }
-    if (options.ForwardedHost) {
-        ValidateHeaderName(options.ForwardedHostHeaderName, "ForwardedHeadersOptions::ForwardedHostHeaderName");
-    }
+    EnsureCanConfigure("UseForwardedHeaders");
+    ValidateForwardedHeadersOptions(options);
 
     impl_->middlewares.push_back([options = std::move(options)](HttpContext& context, RequestDelegate next) {
         if (!IsKnownProxy(context.Request().RemoteAddress(), options)) {
@@ -5564,8 +9394,11 @@ WebApplication& WebApplication::UseForwardedHeaders(ForwardedHeadersOptions opti
         if (options.ForwardedHost) {
             auto forwardedHost = SelectForwardedValue(context.Request().Header(options.ForwardedHostHeaderName), options.ForwardLimit);
             if (forwardedHost && !forwardedHost->empty() && !ContainsUnsafeHeaderValueCharacters(*forwardedHost)) {
-                context.Request().Host(*forwardedHost);
-                applied = true;
+                auto parsedHost = TryParseHostForFiltering(*forwardedHost);
+                if (parsedHost) {
+                    context.Request().Host(HostForHeader(*parsedHost));
+                    applied = true;
+                }
             }
         }
 
@@ -5577,17 +9410,51 @@ WebApplication& WebApplication::UseForwardedHeaders(ForwardedHeadersOptions opti
     return *this;
 }
 
+WebApplication& WebApplication::UseHostFiltering(HostFilteringOptions options) {
+    EnsureCanConfigure("UseHostFiltering");
+    ValidateHostFilteringOptions(options);
+    std::vector<HostFilterPattern> patterns = BuildHostFilterPatterns(options.AllowedHosts, "HostFilteringOptions::AllowedHosts");
+    impl_->middlewares.push_back([this, options = std::move(options), patterns = std::move(patterns)](HttpContext& context, RequestDelegate next) {
+        if (patterns.empty()) {
+            return next(context);
+        }
+
+        std::string host = context.Request().Host().empty()
+            ? context.Request().Header("Host")
+            : context.Request().Host();
+        bool allowed = IsHostAllowed(std::move(host), patterns, options.AllowEmptyHost);
+        if (!options.ItemKey.empty()) {
+            context.Items()[options.ItemKey] = !allowed;
+        }
+        if (allowed) {
+            return next(context);
+        }
+        return CreateProblemResult(
+            context,
+            StatusReason(options.RejectedStatusCode),
+            options.FailureDetail,
+            options.RejectedStatusCode,
+            impl_->options.ProblemDetails,
+            &impl_->options.Log);
+    });
+    return *this;
+}
+
 WebApplication& WebApplication::UseRequestId(RequestIdOptions options) {
+    EnsureCanConfigure("UseRequestId");
     ValidateHeaderName(options.HeaderName, "RequestIdOptions::HeaderName");
     if (options.AddResponseHeader) {
         ValidateHeaderName(options.ResponseHeaderName, "RequestIdOptions::ResponseHeaderName");
+    }
+    if (!options.ItemKey.empty()) {
+        ValidateHeaderValue(options.ItemKey, "RequestIdOptions::ItemKey");
     }
 
     impl_->middlewares.push_back([options = std::move(options)](HttpContext& context, RequestDelegate next) {
         std::string traceIdentifier = context.TraceIdentifier();
         if (options.TrustIncomingHeader) {
             std::string incoming = Trim(context.Request().Header(options.HeaderName));
-            if (!incoming.empty()) {
+            if (IsAcceptableRequestIdValue(incoming, options.MaxLength)) {
                 traceIdentifier = std::move(incoming);
                 context.TraceIdentifier(traceIdentifier);
             }
@@ -5604,7 +9471,38 @@ WebApplication& WebApplication::UseRequestId(RequestIdOptions options) {
     return *this;
 }
 
+WebApplication& WebApplication::UseServerTiming(ServerTimingOptions options) {
+    EnsureCanConfigure("UseServerTiming");
+    ValidateServerTimingOptions(options);
+    impl_->middlewares.push_back([options = std::move(options)](HttpContext& context, RequestDelegate next) {
+        auto started = std::chrono::steady_clock::now();
+        try {
+            HttpResult result = next(context);
+            double elapsedMilliseconds = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - started).count();
+            if (!options.ItemKey.empty()) {
+                context.Items()[options.ItemKey] = elapsedMilliseconds;
+            }
+            if (result.HasResponse()) {
+                AddServerTimingHeaders(result.Headers(), options, elapsedMilliseconds);
+                return result;
+            }
+            AddServerTimingHeaders(context.Response().Headers(), options, elapsedMilliseconds);
+            return Results::Empty();
+        } catch (...) {
+            if (!options.ItemKey.empty()) {
+                double elapsedMilliseconds = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - started).count();
+                context.Items()[options.ItemKey] = elapsedMilliseconds;
+            }
+            throw;
+        }
+    });
+    return *this;
+}
+
 WebApplication& WebApplication::UseRateLimiter(RateLimitOptions options) {
+    EnsureCanConfigure("UseRateLimiter");
     ValidateRateLimitOptions(options);
     auto limiter = std::make_shared<FixedWindowRateLimiter>();
     impl_->middlewares.push_back([limiter, options = std::move(options)](HttpContext& context, RequestDelegate next) {
@@ -5619,7 +9517,11 @@ WebApplication& WebApplication::UseRateLimiter(RateLimitOptions options) {
 
         if (decision.Allowed) {
             AddRateLimitHeaders(context.Response().Headers(), options, decision);
-            return next(context);
+            HttpResult result = next(context);
+            if (result.HasResponse()) {
+                AddRateLimitHeaders(result, options, decision);
+            }
+            return result;
         }
 
         HttpResult result = Results::Problem(StatusReason(options.RejectedStatusCode), "Rate limit exceeded.", options.RejectedStatusCode);
@@ -5630,23 +9532,28 @@ WebApplication& WebApplication::UseRateLimiter(RateLimitOptions options) {
 }
 
 WebApplication& WebApplication::UseRequestLogging(RequestLoggingOptions options) {
+    EnsureCanConfigure("UseRequestLogging");
+    ValidateRequestLoggingOptions(options);
     Logger logger = impl_->options.Log;
     impl_->middlewares.push_back([options, logger](HttpContext& context, RequestDelegate next) {
         auto started = std::chrono::steady_clock::now();
         auto buildMessage = [&](int status) {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
-            std::string target = context.Request().Path();
-            if (options.IncludeQueryString && !context.Request().QueryString().empty()) {
-                target += context.Request().QueryString();
-            }
+            std::string target = BuildLoggedRequestTarget(context.Request(), options);
 
             std::string message = context.Request().Method() + " " + target + " -> " +
                 std::to_string(status) + " in " + std::to_string(elapsed.count()) + " ms";
             if (options.IncludeRemoteAddress && !context.Request().RemoteAddress().empty()) {
-                message += " from " + context.Request().RemoteAddress();
+                message += " from " + SanitizeLogText(context.Request().RemoteAddress());
             }
             if (options.IncludeTraceIdentifier && !context.TraceIdentifier().empty()) {
                 message += " traceId=" + context.TraceIdentifier();
+            }
+            if (options.IncludeEndpoint) {
+                std::string endpoint = context.EndpointName(context.EndpointPattern());
+                if (!endpoint.empty()) {
+                    message += " endpoint=" + SanitizeLogText(endpoint);
+                }
             }
             return message;
         };
@@ -5666,6 +9573,7 @@ WebApplication& WebApplication::UseRequestLogging(RequestLoggingOptions options)
 }
 
 WebApplication& WebApplication::UseMetrics(MetricsOptions options) {
+    EnsureCanConfigure("UseMetrics");
     auto metrics = impl_->metrics;
     impl_->middlewares.push_back([metrics, options](HttpContext& context, RequestDelegate next) {
         metrics->RecordStarted();
@@ -5673,12 +9581,13 @@ WebApplication& WebApplication::UseMetrics(MetricsOptions options) {
         try {
             HttpResult result = next(context);
             int status = result.HasResponse() ? result.StatusCode() : context.Response().StatusCode();
+            std::uint64_t responseBytes = RequestMetricsStore::ResponseBodyBytes(context, result, status);
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
-            metrics->RecordCompleted(context, status, elapsed, options);
+            metrics->RecordCompleted(context, status, elapsed, responseBytes, options);
             return result;
         } catch (...) {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
-            metrics->RecordCompleted(context, 500, elapsed, options);
+            metrics->RecordCompleted(context, 500, elapsed, 0, options);
             throw;
         }
     });
@@ -5686,11 +9595,11 @@ WebApplication& WebApplication::UseMetrics(MetricsOptions options) {
 }
 
 WebApplication& WebApplication::MapMetrics(MetricsEndpointOptions options) {
-    if (options.Path.empty()) {
-        options.Path = "/metrics";
-    }
+    EnsureCanConfigure("MapMetrics");
+    options.Path = NormalizeFrameworkEndpointPath(std::move(options.Path), "MetricsEndpointOptions::Path", "/metrics");
     auto metrics = impl_->metrics;
-    return MapGet(options.Path, [this, metrics, options = std::move(options)] {
+    std::string path = options.Path;
+    return MapGet(std::move(path), [this, metrics, options = std::move(options)] {
         System::Text::Json::JsonObject payload = metrics->Snapshot(options);
         payload.Add("isRunning", System::Text::Json::JsonNode::Create(IsRunning()));
         payload.Add("isStopping", System::Text::Json::JsonNode::Create(IsStopping()));
@@ -5699,58 +9608,78 @@ WebApplication& WebApplication::MapMetrics(MetricsEndpointOptions options) {
     });
 }
 
-WebApplication& WebApplication::AddHealthCheck(std::string name, HealthCheck check) {
+WebApplication& WebApplication::AddHealthCheck(std::string name, HealthCheck check, std::vector<std::string> tags) {
+    EnsureCanConfigure("AddHealthCheck");
     name = Trim(std::move(name));
     if (name.empty()) {
         throw std::invalid_argument("Health check name cannot be empty.");
     }
+    ValidateHeaderValue(name, "Health check name");
     if (!check) {
         throw std::invalid_argument("Health check callback cannot be empty.");
     }
     for (const auto& existing : impl_->healthChecks) {
-        if (EqualsIgnoreCase(existing.first, name)) {
+        if (EqualsIgnoreCase(existing.Name, name)) {
             throw std::invalid_argument("Health check '" + name + "' is already registered.");
         }
     }
-    impl_->healthChecks.emplace_back(std::move(name), std::move(check));
+    impl_->healthChecks.push_back(HealthCheckRegistration{
+        std::move(name),
+        std::move(check),
+        NormalizeHealthCheckTags(std::move(tags))
+    });
     return *this;
 }
 
 WebApplication& WebApplication::MapHealthChecks(HealthCheckOptions options) {
-    if (options.Path.empty()) {
-        options.Path = "/health";
-    }
-    return MapGet(options.Path, [this, options = std::move(options)] {
-        return CreateHealthCheckResult(impl_->healthChecks, options);
+    EnsureCanConfigure("MapHealthChecks");
+    ValidateHealthCheckOptions(options);
+    options.Path = NormalizeFrameworkEndpointPath(std::move(options.Path), "HealthCheckOptions::Path", "/health");
+    options.Tags = NormalizeHealthCheckTags(std::move(options.Tags));
+    std::string path = options.Path;
+    return MapGet(std::move(path), [this, options = std::move(options)] {
+        return CreateHealthCheckResult(
+            impl_->healthChecks,
+            options,
+            IsRunning(),
+            IsStopping(),
+            ActiveRequestCount());
     });
 }
 
 WebApplication& WebApplication::UseHealthChecks(HealthCheckOptions options) {
+    EnsureCanConfigure("UseHealthChecks");
     return MapHealthChecks(std::move(options));
 }
 
 WebApplication& WebApplication::MapOpenApi(OpenApiOptions options) {
-    if (options.Path.empty()) {
-        options.Path = "/openapi.json";
-    }
-    return MapGet(options.Path, [this, options = std::move(options)] {
+    EnsureCanConfigure("MapOpenApi");
+    ValidateOpenApiOptions(options);
+    options.Path = NormalizeFrameworkEndpointPath(std::move(options.Path), "OpenApiOptions::Path", "/openapi.json");
+    std::string path = options.Path;
+    return MapGet(std::move(path), [this, options = std::move(options)] {
         return Results::Json(CreateOpenApiDocument(impl_->endpoints, options, impl_->authorizationOptions));
     }).ExcludeFromDescription();
 }
 
 WebApplication& WebApplication::MapSwaggerUi(SwaggerUiOptions options) {
-    if (options.Path.empty()) {
-        options.Path = "/docs";
-    }
-    if (options.OpenApiPath.empty()) {
-        options.OpenApiPath = "/openapi.json";
-    }
-    return MapGet(options.Path, [options = std::move(options)] {
+    EnsureCanConfigure("MapSwaggerUi");
+    ValidateSwaggerUiOptions(options);
+    options.Path = NormalizeFrameworkEndpointPath(std::move(options.Path), "SwaggerUiOptions::Path", "/docs");
+    options.OpenApiPath = NormalizeFrameworkEndpointPath(std::move(options.OpenApiPath), "SwaggerUiOptions::OpenApiPath", "/openapi.json");
+    std::string path = options.Path;
+    return MapGet(std::move(path), [options = std::move(options)] {
         return Results::Content(CreateSwaggerUiHtml(options), "text/html; charset=utf-8");
     }).ExcludeFromDescription();
 }
 
+RouteGroupBuilder WebApplication::MapGroup(std::string prefix) {
+    EnsureCanConfigure("MapGroup");
+    return RouteGroupBuilder(*this, std::move(prefix));
+}
+
 WebApplication& WebApplication::OnStarted(ApplicationCallback callback) {
+    EnsureCanConfigure("OnStarted");
     if (!callback) {
         throw std::invalid_argument("OnStarted callback cannot be empty.");
     }
@@ -5759,6 +9688,7 @@ WebApplication& WebApplication::OnStarted(ApplicationCallback callback) {
 }
 
 WebApplication& WebApplication::OnStopping(ApplicationCallback callback) {
+    EnsureCanConfigure("OnStopping");
     if (!callback) {
         throw std::invalid_argument("OnStopping callback cannot be empty.");
     }
@@ -5767,6 +9697,7 @@ WebApplication& WebApplication::OnStopping(ApplicationCallback callback) {
 }
 
 WebApplication& WebApplication::OnStopped(ApplicationCallback callback) {
+    EnsureCanConfigure("OnStopped");
     if (!callback) {
         throw std::invalid_argument("OnStopped callback cannot be empty.");
     }
@@ -5775,7 +9706,8 @@ WebApplication& WebApplication::OnStopped(ApplicationCallback callback) {
 }
 
 WebApplication& WebApplication::AddHostedService(HostedServiceOptions service) {
-    service.Name = Trim(std::move(service.Name));
+    EnsureCanConfigure("AddHostedService");
+    service.Name = NormalizeHostedServiceName(std::move(service.Name), "HostedServiceOptions::Name");
     if (!service.Start && !service.Stop) {
         throw std::invalid_argument("Hosted service must provide Start or Stop callback.");
     }
@@ -5783,6 +9715,13 @@ WebApplication& WebApplication::AddHostedService(HostedServiceOptions service) {
     std::lock_guard lock(impl_->mutex);
     if (impl_->running.load() || impl_->server) {
         throw std::logic_error("Hosted services must be registered before the application starts.");
+    }
+    if (!service.Name.empty()) {
+        for (const HostedServiceRegistration& existing : impl_->hostedServices) {
+            if (EqualsIgnoreCase(existing.Name, service.Name)) {
+                throw std::invalid_argument("Duplicate hosted service name: " + service.Name);
+            }
+        }
     }
 
     HostedServiceRegistration registration;
@@ -5794,23 +9733,34 @@ WebApplication& WebApplication::AddHostedService(HostedServiceOptions service) {
 }
 
 WebApplication& WebApplication::AddBackgroundService(BackgroundServiceOptions service) {
-    service.Name = Trim(std::move(service.Name));
+    EnsureCanConfigure("AddBackgroundService");
+    service.Name = NormalizeHostedServiceName(std::move(service.Name), "BackgroundServiceOptions::Name");
     if (!service.Execute) {
         throw std::invalid_argument("Background service must provide Execute callback.");
+    }
+    if (service.StopTimeout.count() < 0) {
+        throw std::out_of_range("BackgroundServiceOptions::StopTimeout cannot be negative.");
     }
 
     struct BackgroundServiceRuntime {
         std::string Name;
         BackgroundServiceCallback Execute;
         bool StopApplicationOnException = true;
-        std::jthread Thread;
+        std::chrono::milliseconds StopTimeout = std::chrono::seconds(30);
+        bool DetachOnStopTimeout = false;
+        std::thread Thread;
+        std::stop_source StopSource;
         std::mutex Mutex;
+        std::condition_variable Finished;
+        bool FinishedRunning = true;
     };
 
     auto runtime = std::make_shared<BackgroundServiceRuntime>();
     runtime->Name = std::move(service.Name);
     runtime->Execute = std::move(service.Execute);
     runtime->StopApplicationOnException = service.StopApplicationOnException;
+    runtime->StopTimeout = service.StopTimeout;
+    runtime->DetachOnStopTimeout = service.DetachOnStopTimeout;
 
     HostedServiceOptions hosted;
     hosted.Name = runtime->Name;
@@ -5820,7 +9770,10 @@ WebApplication& WebApplication::AddBackgroundService(BackgroundServiceOptions se
             return;
         }
 
-        runtime->Thread = std::jthread([runtime, &app](std::stop_token token) {
+        runtime->StopSource = std::stop_source();
+        runtime->FinishedRunning = false;
+        std::stop_token token = runtime->StopSource.get_token();
+        runtime->Thread = std::thread([runtime, &app, token]() mutable {
             try {
                 runtime->Execute(app, token);
             } catch (const std::exception& ex) {
@@ -5834,24 +9787,47 @@ WebApplication& WebApplication::AddBackgroundService(BackgroundServiceOptions se
                     app.Stop();
                 }
             }
+            {
+                std::lock_guard finishedLock(runtime->Mutex);
+                runtime->FinishedRunning = true;
+            }
+            runtime->Finished.notify_all();
         });
     };
-    hosted.Stop = [runtime](WebApplication&) {
-        std::jthread threadToJoin;
+    hosted.Stop = [runtime](WebApplication& app) {
+        std::thread threadToJoin;
+        bool timedOut = false;
         {
-            std::lock_guard lock(runtime->Mutex);
+            std::unique_lock lock(runtime->Mutex);
             if (!runtime->Thread.joinable()) {
                 return;
             }
-            runtime->Thread.request_stop();
+            runtime->StopSource.request_stop();
             if (runtime->Thread.get_id() == std::this_thread::get_id()) {
                 runtime->Thread.detach();
                 return;
+            }
+            if (runtime->StopTimeout.count() > 0 &&
+                !runtime->Finished.wait_for(lock, runtime->StopTimeout, [&] {
+                    return runtime->FinishedRunning;
+                })) {
+                timedOut = true;
+                Log(app.Options().Log, LogLevel::Warning,
+                    "Background service '" + runtime->Name + "' did not stop within " +
+                        std::to_string(runtime->StopTimeout.count()) + " ms.");
+                if (runtime->DetachOnStopTimeout) {
+                    runtime->Thread.detach();
+                    return;
+                }
             }
             threadToJoin = std::move(runtime->Thread);
         }
         if (threadToJoin.joinable()) {
             threadToJoin.join();
+            if (timedOut) {
+                Log(app.Options().Log, LogLevel::Information,
+                    "Background service '" + runtime->Name + "' stopped after the timeout warning.");
+            }
         }
     };
     return AddHostedService(std::move(hosted));
@@ -5862,14 +9838,24 @@ WebApplication& WebApplication::MapMethods(std::initializer_list<std::string> me
 }
 
 WebApplication& WebApplication::MapMethods(std::vector<std::string> methods, std::string pattern, EndpointHandler handler) {
+    EnsureCanConfigure("MapMethods");
+    if (!handler) {
+        throw std::invalid_argument("Endpoint handler cannot be empty.");
+    }
+    std::vector<std::string> normalizedMethods;
+    normalizedMethods.reserve(methods.size());
     for (std::string& method : methods) {
-        method = ToUpperAscii(method);
+        method = NormalizeEndpointMethod(std::move(method), "HTTP method");
+        if (!ContainsTokenIgnoreCase(normalizedMethods, method)) {
+            normalizedMethods.push_back(std::move(method));
+        }
     }
     RouteEndpoint endpoint;
-    endpoint.Methods = std::move(methods);
-    endpoint.Pattern = NormalizeRoutePath(std::move(pattern));
+    endpoint.Methods = std::move(normalizedMethods);
+    endpoint.Pattern = NormalizeEndpointRoutePattern(std::move(pattern), "Route pattern");
     endpoint.Segments = CompileRoutePattern(endpoint.Pattern);
     endpoint.Handler = std::move(handler);
+    impl_->ValidateEndpointDoesNotConflict(endpoint);
     impl_->endpoints.push_back(std::move(endpoint));
     impl_->lastEndpointIndex = impl_->endpoints.size() - 1;
     impl_->lastEndpointIsFallback = false;
@@ -5877,16 +9863,87 @@ WebApplication& WebApplication::MapMethods(std::vector<std::string> methods, std
 }
 
 WebApplication& WebApplication::MapFallback(EndpointHandler handler) {
+    EnsureCanConfigure("MapFallback");
+    if (!handler) {
+        throw std::invalid_argument("Fallback endpoint handler cannot be empty.");
+    }
+    if (impl_->fallback) {
+        throw std::invalid_argument("A fallback endpoint is already registered.");
+    }
     RouteEndpoint endpoint;
     endpoint.Methods.clear();
     endpoint.Pattern = "{*path}";
     endpoint.Segments = CompileRoutePattern(endpoint.Pattern);
     endpoint.Handler = std::move(handler);
     endpoint.IsFallback = true;
+    impl_->ValidateEndpointDoesNotConflict(endpoint);
     impl_->fallback = std::move(endpoint);
     impl_->lastEndpointIndex.reset();
     impl_->lastEndpointIsFallback = true;
     return *this;
+}
+
+std::optional<std::string> WebApplication::TryPathByName(std::string_view name, const ValueMap& routeValues, const ValueMap& queryValues) const {
+    if (!impl_) {
+        throw std::logic_error("Cannot generate a path with a moved-from WebApplication.");
+    }
+    const RouteEndpoint* endpoint = impl_->FindEndpointByName(name);
+    if (endpoint == nullptr) {
+        return std::nullopt;
+    }
+    return TryBuildPathFromEndpoint(*endpoint, routeValues, queryValues, nullptr);
+}
+
+std::string WebApplication::PathByName(std::string_view name, const ValueMap& routeValues, const ValueMap& queryValues) const {
+    if (!impl_) {
+        throw std::logic_error("Cannot generate a path with a moved-from WebApplication.");
+    }
+    const RouteEndpoint* endpoint = impl_->FindEndpointByName(name);
+    if (endpoint == nullptr) {
+        throw std::invalid_argument("No endpoint named '" + std::string(name) + "' is registered.");
+    }
+    std::string error;
+    auto path = TryBuildPathFromEndpoint(*endpoint, routeValues, queryValues, &error);
+    if (!path) {
+        throw std::invalid_argument(error.empty()
+            ? "Could not generate a path for endpoint '" + std::string(name) + "'."
+            : error);
+    }
+    return *path;
+}
+
+std::optional<std::string> WebApplication::TryUrlByName(const HttpContext& context, std::string_view name, const ValueMap& routeValues, const ValueMap& queryValues) const {
+    return TryUrlByName(context.Request(), name, routeValues, queryValues);
+}
+
+std::optional<std::string> WebApplication::TryUrlByName(const HttpRequest& request, std::string_view name, const ValueMap& routeValues, const ValueMap& queryValues) const {
+    auto path = TryPathByName(name, routeValues, queryValues);
+    if (!path) {
+        return std::nullopt;
+    }
+    return TryBuildAbsoluteUrl(request, std::move(*path), nullptr);
+}
+
+std::string WebApplication::UrlByName(const HttpContext& context, std::string_view name, const ValueMap& routeValues, const ValueMap& queryValues) const {
+    return UrlByName(context.Request(), name, routeValues, queryValues);
+}
+
+std::string WebApplication::UrlByName(const HttpRequest& request, std::string_view name, const ValueMap& routeValues, const ValueMap& queryValues) const {
+    std::string path = PathByName(name, routeValues, queryValues);
+    std::string error;
+    auto url = TryBuildAbsoluteUrl(request, std::move(path), &error);
+    if (!url) {
+        throw std::invalid_argument(error.empty()
+            ? "Could not generate an absolute URL for endpoint '" + std::string(name) + "'."
+            : error);
+    }
+    return *url;
+}
+
+void WebApplication::MarkLastEndpointAuthorizationRequirementsAsGroup() {
+    EnsureCanConfigure("RouteGroupBuilder::ApplyGroupMetadata");
+    RouteEndpoint& endpoint = impl_->LastEndpoint("RouteGroupBuilder::ApplyGroupMetadata");
+    endpoint.GroupAuthorizationRequirementCount = endpoint.AuthorizationRequirements.size();
 }
 
 WebApplication& WebApplication::RequireAuthorization(std::string policy) {
@@ -5898,6 +9955,7 @@ WebApplication& WebApplication::RequireAuthorization(std::string policy) {
 }
 
 WebApplication& WebApplication::RequireAuthorization(std::initializer_list<std::string> policies) {
+    EnsureCanConfigure("RequireAuthorization");
     RouteEndpoint& endpoint = impl_->LastEndpoint("RequireAuthorization");
     endpoint.RequireAuthorization = true;
     endpoint.AllowAnonymous = false;
@@ -5910,19 +9968,77 @@ WebApplication& WebApplication::RequireAuthorization(std::initializer_list<std::
     return *this;
 }
 
+WebApplication& WebApplication::RequireAuthorization(AuthorizationPolicy policy) {
+    EnsureCanConfigure("RequireAuthorization");
+    ValidateAuthorizationPolicyFields(policy, "Endpoint authorization policy");
+    RouteEndpoint& endpoint = impl_->LastEndpoint("RequireAuthorization");
+    endpoint.RequireAuthorization = true;
+    endpoint.AllowAnonymous = false;
+    endpoint.AuthorizationRequirements.push_back(std::move(policy));
+    return *this;
+}
+
+WebApplication& WebApplication::RequireRole(std::string role) {
+    EnsureCanConfigure("RequireRole");
+    EnsureEndpointAuthorizationRequirement(impl_->LastEndpoint("RequireRole")).RequireRole(std::move(role));
+    return *this;
+}
+
+WebApplication& WebApplication::RequireRoles(std::initializer_list<std::string> roles) {
+    EnsureCanConfigure("RequireRoles");
+    EnsureEndpointAuthorizationRequirement(impl_->LastEndpoint("RequireRoles")).RequireRoles(roles);
+    return *this;
+}
+
+WebApplication& WebApplication::RequireRoles(std::vector<std::string> roles) {
+    EnsureCanConfigure("RequireRoles");
+    EnsureEndpointAuthorizationRequirement(impl_->LastEndpoint("RequireRoles")).RequireRoles(std::move(roles));
+    return *this;
+}
+
+WebApplication& WebApplication::RequireClaim(std::string type) {
+    EnsureCanConfigure("RequireClaim");
+    EnsureEndpointAuthorizationRequirement(impl_->LastEndpoint("RequireClaim")).RequireClaim(std::move(type));
+    return *this;
+}
+
+WebApplication& WebApplication::RequireClaim(std::string type, std::string value) {
+    EnsureCanConfigure("RequireClaim");
+    EnsureEndpointAuthorizationRequirement(impl_->LastEndpoint("RequireClaim")).RequireClaim(std::move(type), std::move(value));
+    return *this;
+}
+
 WebApplication& WebApplication::AllowAnonymous() {
+    EnsureCanConfigure("AllowAnonymous");
     RouteEndpoint& endpoint = impl_->LastEndpoint("AllowAnonymous");
     endpoint.AllowAnonymous = true;
     return *this;
 }
 
 WebApplication& WebApplication::ExcludeFromDescription() {
+    EnsureCanConfigure("ExcludeFromDescription");
     impl_->LastEndpoint("ExcludeFromDescription").ExcludeFromDescription = true;
     return *this;
 }
 
+WebApplication& WebApplication::AddEndpointFilter(EndpointFilter filter) {
+    EnsureCanConfigure("AddEndpointFilter");
+    if (!filter) {
+        throw std::invalid_argument("Endpoint filter cannot be empty.");
+    }
+    impl_->LastEndpoint("AddEndpointFilter").Filters.push_back(std::move(filter));
+    return *this;
+}
+
 WebApplication& WebApplication::WithName(std::string name) {
-    impl_->LastEndpoint("WithName").Name = Trim(std::move(name));
+    EnsureCanConfigure("WithName");
+    name = Trim(std::move(name));
+    if (!name.empty()) {
+        ValidateHeaderValue(name, "Endpoint name");
+    }
+    RouteEndpoint& endpoint = impl_->LastEndpoint("WithName");
+    impl_->ValidateEndpointNameAvailable(endpoint, name);
+    endpoint.Name = std::move(name);
     return *this;
 }
 
@@ -5931,11 +10047,13 @@ WebApplication& WebApplication::WithTags(std::initializer_list<std::string> tags
 }
 
 WebApplication& WebApplication::WithTags(std::vector<std::string> tags) {
+    EnsureCanConfigure("WithTags");
     RouteEndpoint& endpoint = impl_->LastEndpoint("WithTags");
     endpoint.Tags.clear();
     for (std::string& tag : tags) {
         tag = Trim(std::move(tag));
         if (!tag.empty()) {
+            ValidateHeaderValue(tag, "Endpoint tag");
             endpoint.Tags.push_back(std::move(tag));
         }
     }
@@ -5943,22 +10061,27 @@ WebApplication& WebApplication::WithTags(std::vector<std::string> tags) {
 }
 
 WebApplication& WebApplication::WithSummary(std::string summary) {
+    EnsureCanConfigure("WithSummary");
     impl_->LastEndpoint("WithSummary").Summary = Trim(std::move(summary));
     return *this;
 }
 
 WebApplication& WebApplication::WithDescription(std::string description) {
+    EnsureCanConfigure("WithDescription");
     impl_->LastEndpoint("WithDescription").Description = Trim(std::move(description));
     return *this;
 }
 
 WebApplication& WebApplication::WithParameter(OpenApiParameter parameter) {
+    EnsureCanConfigure("WithParameter");
     parameter.Name = Trim(std::move(parameter.Name));
     parameter.In = Trim(std::move(parameter.In));
     parameter.SchemaType = Trim(std::move(parameter.SchemaType));
-    if (!parameter.Name.empty() && !parameter.In.empty()) {
-        impl_->LastEndpoint("WithParameter").OpenApiParameters.push_back(std::move(parameter));
-    }
+    parameter.SchemaFormat = Trim(std::move(parameter.SchemaFormat));
+    parameter.ItemsSchemaType = Trim(std::move(parameter.ItemsSchemaType));
+    parameter.ItemsSchemaFormat = Trim(std::move(parameter.ItemsSchemaFormat));
+    ValidateOpenApiParameter(parameter, "OpenApiParameter");
+    impl_->LastEndpoint("WithParameter").OpenApiParameters.push_back(std::move(parameter));
     return *this;
 }
 
@@ -5982,7 +10105,36 @@ WebApplication& WebApplication::WithHeaderParameter(std::string name, std::strin
     return WithParameter(std::move(parameter));
 }
 
+WebApplication& WebApplication::WithQueryArrayParameter(std::string name, std::string itemSchemaType, bool required, std::string description, std::string itemSchemaFormat) {
+    OpenApiParameter parameter;
+    parameter.Name = std::move(name);
+    parameter.In = "query";
+    parameter.IsArray = true;
+    parameter.ItemsSchemaType = std::move(itemSchemaType);
+    parameter.ItemsSchemaFormat = std::move(itemSchemaFormat);
+    parameter.Required = required;
+    parameter.Description = std::move(description);
+    return WithParameter(std::move(parameter));
+}
+
+WebApplication& WebApplication::WithHeaderArrayParameter(std::string name, std::string itemSchemaType, bool required, std::string description, std::string itemSchemaFormat) {
+    OpenApiParameter parameter;
+    parameter.Name = std::move(name);
+    parameter.In = "header";
+    parameter.IsArray = true;
+    parameter.ItemsSchemaType = std::move(itemSchemaType);
+    parameter.ItemsSchemaFormat = std::move(itemSchemaFormat);
+    parameter.Required = required;
+    parameter.Description = std::move(description);
+    return WithParameter(std::move(parameter));
+}
+
 WebApplication& WebApplication::Produces(int statusCode, std::string contentType, std::string description) {
+    EnsureCanConfigure("Produces");
+    ValidateHttpStatusCode(statusCode, "Produces statusCode");
+    if (!contentType.empty()) {
+        ValidateMediaTypeValue(contentType, "Produces contentType", false);
+    }
     OpenApiResponse response;
     response.StatusCode = statusCode;
     response.ContentType = std::move(contentType);
@@ -5992,6 +10144,8 @@ WebApplication& WebApplication::Produces(int statusCode, std::string contentType
 }
 
 WebApplication& WebApplication::Accepts(std::string contentType, bool required, std::string description) {
+    EnsureCanConfigure("Accepts");
+    ValidateMediaTypeValue(contentType, "Accepts contentType", true);
     OpenApiRequestBody requestBody;
     requestBody.ContentType = std::move(contentType);
     requestBody.Required = required;
@@ -6013,9 +10167,11 @@ void WebApplication::Start() {
         if (impl_->running.load()) {
             return;
         }
+        impl_->configurationLocked.store(true);
         impl_->stopping.store(false);
         impl_->server = std::make_unique<HttpSysServer>(
             impl_->options.HttpSys,
+            impl_->options.Forms,
             impl_->options.Log,
             impl_->options.DetailedErrors,
             impl_->options.ProblemDetails);
@@ -6023,10 +10179,17 @@ void WebApplication::Start() {
             impl_->server->Start([this](HttpContext& context) {
                 return impl_->Dispatch(context);
             });
+            if (!impl_->server->IsRunning()) {
+                impl_->server.reset();
+                impl_->running.store(false);
+                impl_->stopping.store(false);
+                return;
+            }
         } catch (...) {
             impl_->server.reset();
             impl_->running.store(false);
             impl_->stopping.store(false);
+            impl_->configurationLocked.store(false);
             throw;
         }
         impl_->running.store(true);
@@ -6096,6 +10259,47 @@ void WebApplication::WaitForShutdown() {
 void WebApplication::Run() {
     Start();
     WaitForShutdown();
+}
+
+HttpResponse WebApplication::Handle(HttpContext& context) {
+    if (!impl_) {
+        throw std::logic_error("Cannot handle a request with a moved-from WebApplication.");
+    }
+    if (context.Request().Method().empty()) {
+        context.Request().Method("GET");
+    }
+    if (context.Request().Path().empty()) {
+        context.Request().Path("/");
+    }
+    if (context.TraceIdentifier().empty()) {
+        context.TraceIdentifier(GenerateTraceIdentifier());
+    }
+
+    context.response_ = HttpResponse();
+    context.request_.routeValues_.clear();
+    context.matchedEndpoint_.reset();
+    HttpResult result = ExecuteWithErrorHandling(context, [this](HttpContext& current) {
+        current.request_.formOptions_ = impl_->options.Forms;
+        current.request_.form_.reset();
+        current.request_.formValues_.reset();
+        current.request_.files_.reset();
+        EnsureRequestSizeLimits(current.Request(), impl_->options.HttpSys);
+        std::uint64_t maxBodyBytes = impl_->options.HttpSys.MaxRequestBodyBytes;
+        if (maxBodyBytes != 0 &&
+            static_cast<std::uint64_t>(current.Request().Body().size()) > maxBodyBytes) {
+            throw std::length_error("Request body exceeds MaxRequestBodyBytes.");
+        }
+        return impl_->Dispatch(current);
+    }, impl_->options.DetailedErrors, impl_->options.ProblemDetails, &impl_->options.Log);
+    result.Apply(context.Response());
+    FinalizeInMemoryResponse(context.Request(), context.Response());
+    return context.Response();
+}
+
+HttpResponse WebApplication::Handle(HttpRequest request) {
+    HttpContext context;
+    context.request_ = std::move(request);
+    return Handle(context);
 }
 
 bool WebApplication::IsRunning() const noexcept {
