@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CapiWeb Sample</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: "Segoe UI", Arial, sans-serif;
+      background: #f4f7f5;
+      color: #17211d;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+    }
+    main {
+      width: min(880px, calc(100vw - 32px));
+      display: grid;
+      gap: 18px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 34px;
+      font-weight: 650;
+      letter-spacing: 0;
+    }
+    p {
+      margin: 0;
+      color: #516158;
+      line-height: 1.55;
+    }
+    .panel {
+      background: #ffffff;
+      border: 1px solid #dbe4df;
+      border-radius: 8px;
+      padding: 18px;
+      box-shadow: 0 12px 34px rgba(23, 33, 29, 0.08);
+    }
+    .row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    button {
+      border: 0;
+      border-radius: 6px;
+      padding: 10px 14px;
+      background: #1f6f5b;
+      color: #fff;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    input {
+      min-width: 110px;
+      padding: 9px 10px;
+      border: 1px solid #cbd7d0;
+      border-radius: 6px;
+      font: inherit;
+    }
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #10211c;
+      color: #d9fff1;
+      border-radius: 6px;
+      padding: 14px;
+      min-height: 92px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section>
+      <h1>CapiWeb</h1>
+      <p>HTTP.sys-hosted C++ WebAPI and static frontend from one listener.</p>
+    </section>
+
+    <section class="panel">
+      <div class="row">
+        <button id="health">GET /api/health</button>
+        <input id="name" value="cpp">
+        <button id="echo">GET /api/echo/{name}</button>
+        <input id="a" type="number" value="20">
+        <input id="b" type="number" value="22">
+        <button id="sum">POST /api/sum</button>
+      </div>
+    </section>
+
+    <pre id="output">Ready.</pre>
+  </main>
+
+  <script>
+    const output = document.querySelector("#output");
+    const show = async (promise) => {
+      try {
+        const response = await promise;
+        const text = await response.text();
+        output.textContent = `${response.status} ${response.statusText}\n${JSON.stringify(JSON.parse(text), null, 2)}`;
+      } catch (error) {
+        output.textContent = String(error);
+      }
+    };
+
+    document.querySelector("#health").addEventListener("click", () => {
+      show(fetch("/api/health"));
+    });
+
+    document.querySelector("#echo").addEventListener("click", () => {
+      const name = encodeURIComponent(document.querySelector("#name").value || "cpp");
+      show(fetch(`/api/echo/${name}`));
+    });
+
+    document.querySelector("#sum").addEventListener("click", () => {
+      const a = Number(document.querySelector("#a").value || "0");
+      const b = Number(document.querySelector("#b").value || "0");
+      show(fetch("/api/sum", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ a, b })
+      }));
+    });
+  </script>
+</body>
+</html>
