@@ -526,7 +526,7 @@ std::optional<std::filesystem::path> ResolveStaticFilePath(const StaticFileOptio
 
     if (options.EnableSpaFallback) {
         std::string accept = request.Header("Accept");
-        bool acceptsHtml = accept.empty() || accept.find("text/html") != std::string::npos || accept.find("*/*") != std::string::npos;
+        bool acceptsHtml = accept.empty() || accept.find("text/html") != std::string::npos;
         bool looksLikePageRoute = relative.extension().empty();
         std::filesystem::path fallback = root / Utf8ToWide(options.SpaFallbackFile);
         if (acceptsHtml && looksLikePageRoute && std::filesystem::is_regular_file(fallback) && IsSameOrChildPath(root, fallback)) {
