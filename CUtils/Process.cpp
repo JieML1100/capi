@@ -138,8 +138,8 @@ std::string Process::MachineName() {
 	QueryFullProcessImageNameA(hProcess, 0, buffer.data(), &size);
 	CloseHandle(hProcess);
 	std::string path = std::string(buffer.data());
-	int index = path.find("\\\\");
-	if (index == -1) return "";
+	std::size_t index = path.find("\\\\");
+	if (index == std::string::npos) return "";
 	return path.substr(2, index - 2);
 }
 int Process::ExitCode() {
@@ -275,7 +275,7 @@ long long Process::TotalProcessorTime() {
 	if (hProcess == NULL) return NULL;
 	GetProcessTimes(hProcess, &lpCreationTime, &lpExitTime, &lpKernelTime, &lpUserTime);
 	CloseHandle(hProcess);
-	return (lpKernelTime.dwHighDateTime << 32) | lpKernelTime.dwLowDateTime;
+	return (static_cast<long long>(lpKernelTime.dwHighDateTime) << 32) | lpKernelTime.dwLowDateTime;
 }
 long long Process::UserProcessorTime() {
 	FILETIME lpCreationTime, lpExitTime, lpKernelTime, lpUserTime;
@@ -283,5 +283,5 @@ long long Process::UserProcessorTime() {
 	if (hProcess == NULL) return NULL;
 	GetProcessTimes(hProcess, &lpCreationTime, &lpExitTime, &lpKernelTime, &lpUserTime);
 	CloseHandle(hProcess);
-	return (lpUserTime.dwHighDateTime << 32) | lpUserTime.dwLowDateTime;
+	return (static_cast<long long>(lpUserTime.dwHighDateTime) << 32) | lpUserTime.dwLowDateTime;
 }

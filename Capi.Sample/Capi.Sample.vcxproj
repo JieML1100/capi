@@ -25,10 +25,16 @@
     <Content Include="wwwroot\index.html">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+    <Content Include="appsettings.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\CapiWeb\CapiWeb.vcxproj">
       <Project>{7ca4c94e-7491-4de9-ba51-0bb02fb2dd60}</Project>
+    </ProjectReference>
+    <ProjectReference Include="..\CUtils\CUtils.vcxproj">
+      <Project>{02aea09a-e5a7-4745-a108-91dd212f9cd6}</Project>
     </ProjectReference>
     <ProjectReference Include="..\JsonLite\JsonLite.vcxproj">
       <Project>{00e19325-42df-4702-bf67-15521b736574}</Project>

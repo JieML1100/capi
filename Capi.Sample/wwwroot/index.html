@@ -84,11 +84,19 @@
     <section class="panel">
       <div class="row">
         <button id="health">GET /api/health</button>
+        <button id="metrics">GET /api/metrics</button>
+        <button id="openapi">GET /openapi.json</button>
+        <button id="docs">/docs</button>
         <input id="name" value="cpp">
         <button id="echo">GET /api/echo/{name}</button>
+        <input id="bindId" type="number" value="7">
+        <input id="multiplier" type="number" value="6">
+        <button id="bind">GET /api/bind/{id}</button>
         <input id="a" type="number" value="20">
         <input id="b" type="number" value="22">
         <button id="sum">POST /api/sum</button>
+        <input id="apiKey" value="demo-secret">
+        <button id="secure">GET /api/secure</button>
       </div>
     </section>
 
@@ -97,23 +105,53 @@
 
   <script>
     const output = document.querySelector("#output");
+    const jsonHeaders = { Accept: "application/json" };
+
     const show = async (promise) => {
       try {
         const response = await promise;
         const text = await response.text();
-        output.textContent = `${response.status} ${response.statusText}\n${JSON.stringify(JSON.parse(text), null, 2)}`;
+        const contentType = response.headers.get("content-type") || "";
+        const preview = text.length > 800 ? `${text.slice(0, 800)}...` : text;
+        if (contentType.toLowerCase().includes("application/json")) {
+          try {
+            output.textContent = `${response.status} ${response.statusText}\n${JSON.stringify(JSON.parse(text), null, 2)}`;
+          } catch (parseError) {
+            output.textContent = `${response.status} ${response.statusText}\nInvalid JSON response (${contentType})\n${preview}\n\n${parseError}`;
+          }
+        } else {
+          output.textContent = `${response.status} ${response.statusText}\n${contentType || "unknown content-type"}\n${preview}`;
+        }
       } catch (error) {
         output.textContent = String(error);
       }
     };
 
     document.querySelector("#health").addEventListener("click", () => {
-      show(fetch("/api/health"));
+      show(fetch("/api/health", { headers: jsonHeaders }));
+    });
+
+    document.querySelector("#metrics").addEventListener("click", () => {
+      show(fetch("/api/metrics", { headers: jsonHeaders }));
+    });
+
+    document.querySelector("#openapi").addEventListener("click", () => {
+      show(fetch("/openapi.json", { headers: jsonHeaders }));
+    });
+
+    document.querySelector("#docs").addEventListener("click", () => {
+      window.location.href = "/docs";
     });
 
     document.querySelector("#echo").addEventListener("click", () => {
       const name = encodeURIComponent(document.querySelector("#name").value || "cpp");
-      show(fetch(`/api/echo/${name}`));
+      show(fetch(`/api/echo/${name}`, { headers: jsonHeaders }));
+    });
+
+    document.querySelector("#bind").addEventListener("click", () => {
+      const id = encodeURIComponent(document.querySelector("#bindId").value || "0");
+      const multiplier = encodeURIComponent(document.querySelector("#multiplier").value || "1");
+      show(fetch(`/api/bind/${id}?multiplier=${multiplier}`, { headers: jsonHeaders }));
     });
 
     document.querySelector("#sum").addEventListener("click", () => {
@@ -121,8 +159,15 @@
       const b = Number(document.querySelector("#b").value || "0");
       show(fetch("/api/sum", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { ...jsonHeaders, "Content-Type": "application/json" },
         body: JSON.stringify({ a, b })
+      }));
+    });
+
+    document.querySelector("#secure").addEventListener("click", () => {
+      const key = document.querySelector("#apiKey").value || "";
+      show(fetch("/api/secure", {
+        headers: { ...jsonHeaders, "X-API-Key": key }
       }));
     });
   </script>
